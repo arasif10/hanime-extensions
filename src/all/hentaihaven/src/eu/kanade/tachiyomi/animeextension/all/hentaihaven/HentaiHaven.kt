@@ -92,12 +92,19 @@ class HentaiHaven : AnimeHttpSource() {
         val slug = hit["slug"]?.jsonPrimitive?.content ?: ""
         url = "/watch/$slug/"
         title = hit["title"]?.jsonObject?.get("rendered")?.jsonPrimitive?.content ?: slug
-        // Thumbnail: use vraven_remote_thumbnail from CMS, fallback to empty
-        val thumbPath = hit["meta"]?.jsonObject?.get("vraven_remote_thumbnail")
+        // Thumbnail: the CMS returns either a full URL or a path relative to the
+        // image host; some paths contain literal spaces that must be encoded.
+        thumbnail_url = hit["meta"]?.jsonObject?.get("vraven_remote_thumbnail")
             ?.jsonPrimitive?.content
             ?.takeIf { it.isNotBlank() }
-            ?.let { "$imageBaseUrl/${it.removePrefix("/")}" }
-        thumbnail_url = thumbPath ?: ""
+            ?.let { it.replace(" ", "%20") }
+            ?.let {
+                if (it.startsWith("http")) {
+                    it
+                } else {
+                    "$imageBaseUrl/${it.removePrefix("/")}"
+                }
+            }
         initialized = true
     }
 
@@ -251,30 +258,28 @@ class HentaiHaven : AnimeHttpSource() {
         animeDetailsRequest(anime)
 
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val document = Jsoup.parse(response.body.string(), baseUrl)
         val watchPath = response.request.url.encodedPath
+        // Only episodes of THIS title - the watch page also contains
+        // "related titles" cards linking to other anime's episodes.
+        val currentSlug = Regex("/watch/([^/]+)").find(watchPath)?.groupValues?.get(1)
+            ?: return emptyList()
+        val document = Jsoup.parse(response.body.string(), baseUrl)
 
-        // Find episode links within the watch page's episode container
-        val episodes = document.select("a[href*=\"episode-\"]")
+        val episodes = document.select("a[href^=\"/watch/$currentSlug/episode-\"]")
             .mapNotNull { anchor ->
                 val href = anchor.attr("href")
                 val number = Regex("episode-(\\d+)").find(href)?.groupValues?.get(1)
                     ?.toFloatOrNull() ?: return@mapNotNull null
-                // Only accept episodes if the href is under the current watch path
-                val slug = Regex("/watch/([^/]+)/episode-").find(href)?.groupValues?.get(1)
-                    ?: return@mapNotNull null
                 SEpisode.create().apply {
-                    url = "/watch/$slug/episode-${number.toInt()}/"
+                    url = "/watch/$currentSlug/episode-${number.toInt()}/"
                     name = "Episode ${number.toInt()}"
                     episode_number = number
                 }
             }
-            // Deduplicate by episode number and sort descending (newest first)
-            .distinctBy { it.episode_number }
+            .distinctBy { it.url }
             .sortedByDescending { it.episode_number }
 
         return episodes.ifEmpty {
-            // Fallback: single episode from the watch page URL
             listOf(
                 SEpisode.create().apply {
                     url = watchPath
@@ -300,7 +305,10 @@ class HentaiHaven : AnimeHttpSource() {
 
     override fun videoListParse(response: Response): List<Video> {
         if (!response.isSuccessful) {
-            throw Exception("HentaiHaven: failed to fetch stream manifest (HTTP ${response.code})")
+            throw Exception(
+                "HentaiHaven: failed to fetch stream manifest (HTTP ${response.code}). " +
+                    "If this persists, the site's video CDN may be blocking your region.",
+            )
         }
 
         val root = json.parseToJsonElement(response.body.string()).jsonObject
@@ -308,6 +316,13 @@ class HentaiHaven : AnimeHttpSource() {
             throw Exception("HentaiHaven: no video sources available for this title")
         }
         val data = root["data"]?.jsonObject ?: return emptyList()
+
+        // Playback headers: some manifest CDNs require the site as Referer.
+        val videoHeaders = okhttp3.Headers.Builder()
+            .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .add("Referer", "$baseUrl/")
+            .add("Origin", baseUrl)
+            .build()
 
         val videos = mutableListOf<Video>()
         val seen = mutableSetOf<String>()
@@ -318,7 +333,7 @@ class HentaiHaven : AnimeHttpSource() {
                 val streamUrl = source["src"]?.jsonPrimitive?.content ?: return@forEach
                 if (streamUrl.isBlank() || !seen.add(streamUrl)) return@forEach
                 val label = source["label"]?.jsonPrimitive?.content ?: "Auto"
-                videos.add(Video(streamUrl, label, streamUrl))
+                videos.add(Video(streamUrl, label, streamUrl, videoHeaders))
             }
         }
 
