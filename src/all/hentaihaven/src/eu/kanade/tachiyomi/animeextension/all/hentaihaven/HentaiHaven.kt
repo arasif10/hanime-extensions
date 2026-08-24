@@ -317,9 +317,12 @@ class HentaiHaven : AnimeHttpSource() {
         }
         val data = root["data"]?.jsonObject ?: return emptyList()
 
-        // Playback headers: some manifest CDNs require the site as Referer.
+        // Playback headers: the site's video CDN rejects non-browser clients,
+        // so send a full browser-like header set.
         val videoHeaders = okhttp3.Headers.Builder()
             .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .add("Accept", "*/*")
+            .add("Accept-Language", "en-US,en;q=0.9")
             .add("Referer", "$baseUrl/")
             .add("Origin", baseUrl)
             .build()
