@@ -19,20 +19,20 @@
     ]
   },
   {
-    "name": "HentaiHeaven",
-    "pkg": "eu.kanade.tachiyomi.animeextension.all.hentaiheaven",
-    "apk": "aniyomi-all.hentaiheaven-v14.02-release.apk",
+    "name": "HentaiHaven",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.hentaihaven",
+    "apk": "aniyomi-all.hentaihaven-v14.03-release.apk",
     "lang": "all",
-    "code": 2,
-    "version": "14.02",
+    "code": 3,
+    "version": "14.03",
     "nsfw": 1,
     "hasReadme": 0,
     "hasChangelog": 0,
     "sources": [
       {
-        "id": 7997647030818101970,
+        "id": 8402038433487384736,
         "lang": "all",
-        "name": "HentaiHeaven",
+        "name": "HentaiHaven",
         "baseUrl": "https://hentaiheaven.xxx"
       }
     ]
