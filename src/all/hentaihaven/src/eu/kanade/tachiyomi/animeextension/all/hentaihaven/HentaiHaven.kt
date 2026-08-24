@@ -1,5 +1,5 @@
 /*lint:disable:standard:filename*/
-package eu.kanade.tachiyomi.animeextension.all.hentaiheaven
+package eu.kanade.tachiyomi.animeextension.all.hentaihaven
 
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -39,11 +39,11 @@ import uy.kohesive.injekt.injectLazy
  * returns HLS manifests. The site sits behind Cloudflare, so requests go
  * through the app's cloudflareClient.
  */
-class HentaiHeaven : AnimeHttpSource() {
+class HentaiHaven : AnimeHttpSource() {
 
-    override val name = "HentaiHeaven"
+    override val name = "HentaiHaven"
 
-    override val baseUrl = "https://hentaiheaven.xxx"
+    override val baseUrl = "https://hentaihaven.xxx"
 
     override val lang = "all"
 
@@ -221,14 +221,10 @@ class HentaiHeaven : AnimeHttpSource() {
         // Author/Studio: find Studio badge
         val author = document.selectFirst("span:containsOwn(Studio)")?.nextElementSibling()
             ?.let { node ->
-                if (node instanceof org.jsoup.nodes.Element) {
-                    node.selectFirst("a")?.text()?.takeIf { it.isNotBlank() }
-                        ?: node.text()?.takeIf { it.isNotBlank() }
-                } else {
-                    null
-                }
-            }?.takeIf { it.isNotBlank() }
-            ?: ""
+                node.selectFirst("a")?.text()?.takeIf { it.isNotBlank() }
+                    ?: node.text().takeIf { it.isNotBlank() }
+            }
+            ?.takeIf { it.isNotBlank() }
 
         // Release date: from the "Released" badge
         val releasedText = document.select("span:containsOwn(Released)")?.text()
@@ -329,7 +325,7 @@ class HentaiHeaven : AnimeHttpSource() {
         addSources("sources")
         addSources("fallbackSources")
 
-        if (videos.isEmpty()) throw Exception("HentaiHeaven: no video sources available for this title")
+        if (videos.isEmpty()) throw Exception("HentaiHaven: no video sources available for this title")
         return videos
     }
 
