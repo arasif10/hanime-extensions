@@ -1,3 +1,4 @@
+/*lint:disable:standard:filename*/
 package eu.kanade.tachiyomi.animeextension.all.hentaiheaven
 
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
