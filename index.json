@@ -17,5 +17,24 @@
         "baseUrl": "https://hanime.tv"
       }
     ]
+  },
+  {
+    "name": "HentaiHeaven",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.hentaiheaven",
+    "apk": "aniyomi-all.hentaiheaven-v14.01-release.apk",
+    "lang": "all",
+    "code": 1,
+    "version": "14.01",
+    "nsfw": 1,
+    "hasReadme": 0,
+    "hasChangelog": 0,
+    "sources": [
+      {
+        "id": 7997647030818101970,
+        "lang": "all",
+        "name": "HentaiHeaven",
+        "baseUrl": "https://hentaiheaven.xxx"
+      }
+    ]
   }
 ]
