@@ -1,4 +1,4 @@
-package eu.kanade.tachiyomi.animeextension.all.hentaihaven
+package eu.kanade.tachiyomi.animeextension.all.hentaiheaven
 
 import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
@@ -38,11 +38,11 @@ import uy.kohesive.injekt.injectLazy
  * returns HLS manifests. The site sits behind Cloudflare, so requests go
  * through the app's cloudflareClient.
  */
-class HentaiHaven : AnimeHttpSource() {
+class HentaiHeaven : AnimeHttpSource() {
 
-    override val name = "HentaiHaven"
+    override val name = "HentaiHeaven"
 
-    override val baseUrl = "https://hentaihaven.xxx"
+    override val baseUrl = "https://hentaiheaven.xxx"
 
     override val lang = "all"
 
@@ -91,10 +91,12 @@ class HentaiHaven : AnimeHttpSource() {
         val slug = hit["slug"]?.jsonPrimitive?.content ?: ""
         url = "/watch/$slug/"
         title = hit["title"]?.jsonObject?.get("rendered")?.jsonPrimitive?.content ?: slug
-        thumbnail_url = hit["meta"]?.jsonObject?.get("vraven_remote_thumbnail")
+        // Thumbnail: use vraven_remote_thumbnail from CMS, fallback to empty
+        val thumbPath = hit["meta"]?.jsonObject?.get("vraven_remote_thumbnail")
             ?.jsonPrimitive?.content
             ?.takeIf { it.isNotBlank() }
             ?.let { "$imageBaseUrl/${it.removePrefix("/")}" }
+        thumbnail_url = thumbPath ?: ""
         initialized = true
     }
 
@@ -139,10 +141,8 @@ class HentaiHaven : AnimeHttpSource() {
         val document = Jsoup.parse(response.body.string(), baseUrl)
         val animeList = document.select("a[href^=\"/watch/\"] img[alt]").mapNotNull { img ->
             val link = img.closest("a[href]") ?: return@mapNotNull null
-            val slug = link.attr("href")
-                .substringAfter("/watch/")
-                .trimEnd('/')
-                .takeIf { it.isNotBlank() && !it.contains('/') }
+            val href = link.attr("href")
+            val slug = href.substringAfter("/watch/").trimEnd('/').takeIf { it.isNotBlank() && !it.contains('/') }
                 ?: return@mapNotNull null
             SAnime.create().apply {
                 url = "/watch/$slug/"
@@ -158,7 +158,7 @@ class HentaiHaven : AnimeHttpSource() {
 
     private class SortFilter : AnimeFilter.Select<String>(
         "Sort by",
-        arrayOf("Most viewed", "Top rated", "Trending", "Newest"),
+        arrayOf("Most viewed", "Top rated", "Trending", "Newest", "Alphabetical"),
         0,
     ) {
         val sortValue: String
@@ -166,7 +166,8 @@ class HentaiHaven : AnimeHttpSource() {
                 1 -> "rating"
                 2 -> "trending"
                 3 -> "latest"
-                else -> "views"
+                4 -> "views"
+                else -> "alpha"
             }
     }
 
@@ -195,26 +196,54 @@ class HentaiHaven : AnimeHttpSource() {
     override fun animeDetailsParse(response: Response): SAnime {
         val document = Jsoup.parse(response.body.string(), baseUrl)
 
+        // Title: og:title strips the " - Hentai Haven | Watch free Hentai HD" suffix
         val title = document.selectFirst("meta[property=og:title]")?.attr("content")
             ?.substringBefore(" - Hentai Haven")
             ?: document.selectFirst("h1")?.text()
             ?: ""
 
+        // Thumbnail: og:image
+        val thumbnail = document.selectFirst("meta[property=og:image]")?.attr("content")
+            ?: ""
+
+        // Description: meta description
+        val description = document.selectFirst("meta[name=description]")?.attr("content")
+
+        // Genre: all series link texts
+        val genre = document.select("a[href^=\"/series/\"]")
+            .map { it.text().trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .joinToString(", ")
+            .takeIf { it.isNotBlank() }
+
+        // Author/Studio: find Studio badge
+        val author = document.selectFirst("span:containsOwn(Studio)")?.nextElementSibling()
+            ?.let { node ->
+                if (node instanceof org.jsoup.nodes.Element) {
+                    node.selectFirst("a")?.text()?.takeIf { it.isNotBlank() }
+                        ?: node.text()?.takeIf { it.isNotBlank() }
+                } else {
+                    null
+                }
+            }?.takeIf { it.isNotBlank() }
+            ?: ""
+
+        // Release date: from the "Released" badge
+        val releasedText = document.select("span:containsOwn(Released)")?.text()
+        val releaseDate = releasedText
+            ?.replace("Released ", "")
+            ?.takeWhile { it != ',' && it != '(' }
+            ?.trim()
+            ?: ""
+
         return SAnime.create().apply {
             this.title = title
-            thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
-                ?: ""
-            description = document.selectFirst("meta[name=description]")?.attr("content")
-            genre = document.select("a[href^=\"/series/\"]")
-                .map { it.text().trim() }
-                .filter { it.isNotBlank() }
-                .distinct()
-                .joinToString(", ")
-                .takeIf { it.isNotBlank() }
-            author = document.selectFirst("span:containsOwn(Studio)")?.nextElementSibling()
-                ?.let { it.selectFirst("a")?.text() ?: it.text() }
-                ?.takeIf { it.isNotBlank() }
-            status = SAnime.COMPLETED
+            this.thumbnail_url = thumbnail
+            this.description = description
+            this.genre = genre
+            this.author = author
+            this.status = SAnime.COMPLETED
             initialized = true
         }
     }
@@ -225,14 +254,16 @@ class HentaiHaven : AnimeHttpSource() {
         animeDetailsRequest(anime)
 
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val watchPath = response.request.url.encodedPath
         val document = Jsoup.parse(response.body.string(), baseUrl)
+        val watchPath = response.request.url.encodedPath
 
+        // Find episode links within the watch page's episode container
         val episodes = document.select("a[href*=\"episode-\"]")
             .mapNotNull { anchor ->
                 val href = anchor.attr("href")
                 val number = Regex("episode-(\\d+)").find(href)?.groupValues?.get(1)
                     ?.toFloatOrNull() ?: return@mapNotNull null
+                // Only accept episodes if the href is under the current watch path
                 val slug = Regex("/watch/([^/]+)/episode-").find(href)?.groupValues?.get(1)
                     ?: return@mapNotNull null
                 SEpisode.create().apply {
@@ -241,10 +272,12 @@ class HentaiHaven : AnimeHttpSource() {
                     episode_number = number
                 }
             }
-            .distinctBy { it.url }
+            // Deduplicate by episode number and sort descending (newest first)
+            .distinctBy { it.episode_number }
             .sortedByDescending { it.episode_number }
 
         return episodes.ifEmpty {
+            // Fallback: single episode from the watch page URL
             listOf(
                 SEpisode.create().apply {
                     url = watchPath
@@ -295,7 +328,7 @@ class HentaiHaven : AnimeHttpSource() {
         addSources("sources")
         addSources("fallbackSources")
 
-        if (videos.isEmpty()) throw Exception("HentaiHaven: no video sources available for this title")
+        if (videos.isEmpty()) throw Exception("HentaiHeaven: no video sources available for this title")
         return videos
     }
 
