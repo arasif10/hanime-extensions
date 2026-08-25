@@ -338,11 +338,15 @@ class OppaiStream : AnimeHttpSource() {
         val videoHeaders = videoHeaders()
 
         // DASH MPDs first (preferred, adaptive) for each available resolution.
+        // 4K encodes are sometimes VP9 level 5.x (e.g. Harem-tou e Youkoso!),
+        // which hard-crashes the native decoder on many devices, so those are probed and dropped.
         dashUrls.entries
             .sortedByDescending { it.key.toIntOrNull() ?: 0 }
             .forEach { (res, url) ->
                 val mpd = url.replace(" ", "%20")
-                videos += Video(mpd, "${res}p (DASH)", mpd, headers = videoHeaders)
+                if (isDecodableMpd(mpd)) {
+                    videos += Video(mpd, "${res}p (DASH)", mpd, headers = videoHeaders)
+                }
             }
 
         // Direct MP4s at each available resolution (fallback, most compatible).
@@ -361,6 +365,23 @@ class OppaiStream : AnimeHttpSource() {
         .set("Origin", baseUrl)
         .add("Accept", "*/*")
         .build()
+
+    /**
+     * Probes a DASH manifest and returns false when its video codec is known to
+     * crash device decoders: VP9 profile level 5.0+ (codec strings like
+     * "vp09.00.50.08"). Everything else (H.264, lower VP9 levels) is fine.
+     */
+    private fun isDecodableMpd(mpdUrl: String): Boolean = runCatching {
+        val body = client.newCall(GET(mpdUrl, videoHeaders())).execute().use { resp ->
+            if (!resp.isSuccessful) return@runCatching true
+            resp.body.string()
+        }
+        val vp9Level = Regex("""codecs="vp09\.\d+\.(\d+)\.\d+"""")
+            .find(body)?.groupValues?.get(1)
+            ?.toIntOrNull()
+            ?: return@runCatching true
+        vp9Level < 50
+    }.getOrDefault(true)
 
     private companion object {
         // (value, display) pairs scraped from the site's genre filter.
