@@ -17,6 +17,7 @@ import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -26,6 +27,7 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import org.jsoup.parser.Parser
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import uy.kohesive.injekt.injectLazy
@@ -73,7 +75,10 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
     private val catalogueApiUrl = "$baseUrl/api/manga/"
     private val imageBaseUrl = "https://img.hentaihaven.xxx"
 
-    private val pageSize = 24
+    // The site itself renders 25 entries per page, and matching that keeps our
+    // Popular/Trending ordering identical to /browse/trending (the ranking metric has
+    // ties, so a different page size can transpose neighbouring entries).
+    private val pageSize = 25
 
     override fun headersBuilder(): Headers.Builder = Headers.Builder()
         .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -89,16 +94,24 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
         tag: Int? = null,
         studio: Int? = null,
         year: Int? = null,
+        trendingPeriod: String? = null,
     ): Request {
         val url = catalogueApiUrl.toHttpUrl().newBuilder().apply {
             addQueryParameter("per_page", pageSize.toString())
             addQueryParameter("page", page.toString())
-            if (!sort.isNullOrBlank()) addQueryParameter("sort", sort)
-            if (!search.isNullOrBlank()) addQueryParameter("search", search)
-            genre?.let { addQueryParameter("genre", it.toString()) }
-            tag?.let { addQueryParameter("tag", it.toString()) }
-            studio?.let { addQueryParameter("author", it.toString()) }
-            year?.let { addQueryParameter("release", it.toString()) }
+            if (trendingPeriod != null) {
+                // The ranking endpoint is exclusive: combining trending_period with a
+                // sort, a search or any taxonomy filter returns HTTP 400
+                // ("Trending filters are not supported by the ranking endpoint").
+                addQueryParameter("trending_period", trendingPeriod)
+            } else {
+                if (!sort.isNullOrBlank()) addQueryParameter("sort", sort)
+                if (!search.isNullOrBlank()) addQueryParameter("search", search)
+                genre?.let { addQueryParameter("genre", it.toString()) }
+                tag?.let { addQueryParameter("tag", it.toString()) }
+                studio?.let { addQueryParameter("author", it.toString()) }
+                year?.let { addQueryParameter("release", it.toString()) }
+            }
         }.build()
         return GET(url.toString(), headers)
     }
@@ -121,43 +134,90 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
     private fun hitToAnime(hit: JsonObject): SAnime = SAnime.create().apply {
         val slug = hit["slug"]?.jsonPrimitive?.content ?: ""
         url = "/watch/$slug/"
-        title = hit["title"]?.jsonObject?.get("rendered")?.jsonPrimitive?.content ?: slug
+        // The CMS renders titles as HTML, so they contain entities such as
+        // &#8230; (ellipsis) and &#038; (ampersand) that must be unescaped.
+        title = hit["title"]?.jsonObject?.get("rendered")?.jsonPrimitive?.content
+            ?.let { Parser.unescapeEntities(it, false).trim() }
+            ?.takeIf { it.isNotBlank() }
+            ?: slug
         thumbnail_url = hit["meta"]?.jsonObject?.get("vraven_remote_thumbnail")
-            ?.jsonPrimitive?.content
+            ?.jsonPrimitive?.contentOrNull
             ?.toThumbnailUrl()
     }
 
     /**
-     * The CMS returns either a full URL or a path relative to the image host, and
-     * some paths contain literal spaces that have to be percent-encoded.
+     * Builds a loadable cover URL.
+     *
+     * The CMS returns either a full URL or a path relative to the image host, and the
+     * paths are raw filesystem names: they can contain spaces and non-ASCII characters
+     * (typographic ellipsis, en dash). Those have to be percent-encoded or the image
+     * request is malformed and the cover silently fails to load, which is why some
+     * posters were blank in the grid.
+     *
+     * Covers whose only asset is AVIF are dropped: Android cannot decode AVIF before
+     * API 31, and returning null lets the app fall back to a placeholder instead of
+     * showing a broken tile.
      */
-    private fun String.toThumbnailUrl(): String? = takeIf { it.isNotBlank() }
-        ?.replace(" ", "%20")
-        ?.let { if (it.startsWith("http")) it else "$imageBaseUrl/${it.removePrefix("/")}" }
+    private fun String.toThumbnailUrl(): String? {
+        val raw = trim().takeIf { it.isNotEmpty() } ?: return null
+        if (raw.endsWith(".avif", ignoreCase = true)) return null
 
-    // ============================== Popular Anime (rebuilt) ==============================
+        val absolute = if (raw.startsWith("http")) raw else "$imageBaseUrl/${raw.removePrefix("/")}"
+        // Already-encoded input must not be double-encoded, so only touch the path
+        // when it still holds characters that are illegal in a URL.
+        return absolute.encodeUrlPath()
+    }
+
+    /** Percent-encodes every path character that is not URL-safe, leaving %XX intact. */
+    private fun String.encodeUrlPath(): String {
+        val schemeEnd = indexOf("://").takeIf { it >= 0 }?.plus(3) ?: return this
+        val pathStart = indexOf('/', schemeEnd).takeIf { it >= 0 } ?: return this
+        val origin = substring(0, pathStart)
+        val path = substring(pathStart)
+
+        val encoded = StringBuilder(path.length)
+        var index = 0
+        while (index < path.length) {
+            val char = path[index]
+            when {
+                // Keep existing percent-escapes as they are.
+                char == '%' && index + 2 < path.length &&
+                    path[index + 1].isHexDigit() && path[index + 2].isHexDigit() -> {
+                    encoded.append(path, index, index + 3)
+                    index += 2
+                }
+                char in URL_PATH_SAFE_CHARS -> encoded.append(char)
+                else -> char.toString().toByteArray(Charsets.UTF_8).forEach { byte ->
+                    encoded.append('%').append("%02X".format(byte.toInt() and 0xFF))
+                }
+            }
+            index++
+        }
+        return origin + encoded
+    }
+
+    private fun Char.isHexDigit(): Boolean =
+        this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'
+
+    // ============================== Popular Anime ==============================
 
     /**
-     * Most-viewed titles. The CMS sorts by the `views` engagement counter; the
-     * response shape is identical to the plain catalogue.
+     * Mirrors the website's Trending rail.
+     *
+     * The homepage "Trending" section and /browse/trending/ are served by the API's
+     * ranking endpoint (`trending_period`), not by `sort=views`. Verified: the first
+     * 25 entries of /browse/trending/ match `trending_period=monthly` in exact order,
+     * whereas `sort=views` gives the all-time most-viewed list instead - which is why
+     * Popular did not look like the site's trending page.
+     *
+     * `trending_period=all` is the all-time ranking; monthly is what the site shows by
+     * default, and the user-facing sort filter can switch to the other orderings.
      */
     override fun popularAnimeRequest(page: Int): Request =
-        catalogueRequest(page, sort = "views")
+        catalogueRequest(page, trendingPeriod = TRENDING_PERIOD_MONTHLY)
 
-    override fun popularAnimeParse(response: Response): AnimesPage {
-        val page = response.request.url.queryParameter("page")?.toIntOrNull() ?: 1
-        val root = json.parseToJsonElement(response.body.string()).jsonObject
-        root["error"]?.jsonPrimitive?.content?.let { error ->
-            throw Exception("HentaiHaven: $error")
-        }
-        val entries = root["data"]?.jsonArray ?: return AnimesPage(emptyList(), false)
-
-        val animeList = entries.mapNotNull { entry ->
-            runCatching { hitToAnime(entry.jsonObject) }.getOrNull()
-        }
-        val totalPages = root["totalPages"]?.jsonPrimitive?.content?.toIntOrNull() ?: 1
-        return AnimesPage(animeList, page < totalPages)
-    }
+    override fun popularAnimeParse(response: Response): AnimesPage =
+        parseCatalogue(response)
 
     // ============================== Latest Updates ==============================
 
@@ -175,12 +235,21 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
         val studio = filters.filterIsInstance<StudioFilter>().firstOrNull()?.selectedId
         val year = filters.filterIsInstance<YearFilter>().firstOrNull()?.selectedId
         val trimmed = query.trim()
+        val sortFilter = filters.filterIsInstance<SortFilter>().firstOrNull()
 
-        // The API only accepts `sort` on its own or alongside `genre`; combining it
-        // with a text search or with the tag/studio/year filters is a hard error.
+        val hasFilter = genre != null || tag != null || studio != null || year != null
+        val unfiltered = trimmed.isEmpty() && !hasFilter
+
+        // The two trending orderings come from the ranking endpoint, which rejects any
+        // other parameter, so they only apply to plain browsing.
+        sortFilter?.trendingPeriod?.takeIf { unfiltered }?.let { period ->
+            return catalogueRequest(page, trendingPeriod = period)
+        }
+
+        // `sort` itself may only be combined with `genre`; pairing it with a text search
+        // or with the tag/studio/year filters is a hard error.
         val sortable = trimmed.isEmpty() && tag == null && studio == null && year == null
-        val sort = filters.filterIsInstance<SortFilter>().firstOrNull()?.sortValue
-            ?.takeIf { sortable }
+        val sort = sortFilter?.sortValue?.takeIf { sortable }
 
         return catalogueRequest(
             page = page,
@@ -200,13 +269,22 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
 
     private class SortFilter : AnimeFilter.Select<String>(
         "Sort by",
-        arrayOf("Latest", "Most viewed", "Top rated"),
+        arrayOf("Trending (monthly)", "Trending (all time)", "Latest", "Most viewed", "Top rated"),
         0,
     ) {
+        /** Non-null for the two rankings served by the ranking endpoint. */
+        val trendingPeriod: String?
+            get() = when (state) {
+                0 -> TRENDING_PERIOD_MONTHLY
+                1 -> TRENDING_PERIOD_ALL
+                else -> null
+            }
+
+        /** Used for everything the plain catalogue endpoint can sort. */
         val sortValue: String
             get() = when (state) {
-                1 -> "views"
-                2 -> "rating"
+                3 -> "views"
+                4 -> "rating"
                 else -> "latest"
             }
     }
@@ -237,7 +315,7 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
         StudioFilter(),
         YearFilter(),
         AnimeFilter.Separator(),
-        AnimeFilter.Header("Sorting applies to plain browsing and to Genre only - a text search or a Tag/Studio/Year filter replaces it"),
+        AnimeFilter.Header("Trending sorts apply to plain browsing only; picking any filter below falls back to Latest/Most viewed/Top rated"),
     )
 
     // ============================== Anime Details ==============================
@@ -280,6 +358,64 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
             status = SAnime.UNKNOWN
             initialized = true
         }
+    }
+
+    // ============================== Recommendations ==============================
+    // AniZen fills its "Recommended" rail from `supportsRelatedAnimes` +
+    // `fetchRelatedAnimeList`. Those members exist on AniZen's runtime source API but
+    // not on the lib-14 stub this compiles against, so they are declared without
+    // `override`; the JVM still dispatches the runtime interface's default methods
+    // to them. Without these the rail stays empty.
+
+    val supportsRelatedAnimes: Boolean get() = true
+
+    suspend fun fetchRelatedAnimeList(anime: SAnime): List<SAnime> {
+        // The watch page already carries a site-curated "See More" rail of other
+        // titles, so prefer it: one request, and it matches what the site shows.
+        val fromPage = runCatching {
+            client.newCall(animeDetailsRequest(anime)).execute().use { response ->
+                if (!response.isSuccessful) return@use emptyList()
+                relatedFromWatchPage(response.body.string(), anime.url)
+            }
+        }.getOrDefault(emptyList())
+
+        if (fromPage.isNotEmpty()) return fromPage
+
+        // Fallback: same-genre titles from the catalogue API.
+        val genreId = anime.genre
+            ?.split(",")
+            ?.asSequence()
+            ?.map { it.trim() }
+            ?.mapNotNull { name -> GENRES.firstOrNull { it.second.equals(name, true) }?.first }
+            ?.firstOrNull { it > 0 }
+            ?: return emptyList()
+
+        return runCatching {
+            client.newCall(catalogueRequest(1, genre = genreId)).execute().use { response ->
+                parseCatalogue(response).animes.filterNot { it.url == anime.url }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    /** Reads the "See More" rail: poster cards linking to other titles. */
+    private fun relatedFromWatchPage(html: String, currentUrl: String): List<SAnime> {
+        val document = Jsoup.parse(html, baseUrl)
+        return document.select("article a[href^=\"/watch/\"]:has(img)")
+            .mapNotNull { anchor ->
+                val href = anchor.attr("href")
+                if (href.isBlank() || href == currentUrl) return@mapNotNull null
+                // Skip episode links; the rail links to title pages.
+                if (EPISODE_REGEX.containsMatchIn(href)) return@mapNotNull null
+                val image = anchor.selectFirst("img") ?: return@mapNotNull null
+                val name = image.attr("alt").trim().ifBlank { return@mapNotNull null }
+                SAnime.create().apply {
+                    url = href
+                    title = name
+                    thumbnail_url = image.attr("src").takeIf { it.isNotBlank() }
+                        ?.let { if (it.endsWith(".avif", true)) null else it }
+                }
+            }
+            .distinctBy { it.url }
     }
 
     // ============================== Episodes ==============================
@@ -359,9 +495,24 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
     }
 
     /**
-     * Parses the HLS master playlist so each rendition becomes its own quality entry.
-     * The video renditions carry no audio, so the separate audio and subtitle
-     * renditions are attached to every entry.
+     * Builds the playable video list from the HLS master playlist.
+     *
+     * How this stream is laid out (all verified against the live CDN):
+     *  - The per-quality variant playlists (`7sop/v.m3u8`, `3cop/v.m3u8`) are
+     *    **video-only** fMP4: their init segment carries a single `vide` handler with
+     *    an `avc1` sample entry and no `mp4a`, despite `EXT-X-STREAM-INF` advertising
+     *    `CODECS="avc1.4d4028,mp4a.40.2"`.
+     *  - Audio is one separate rendition (`snd/a.m3u8`, `soun`/`mp4a`) and subtitles
+     *    are separate WebVTT renditions; both are only referenced by the *master*.
+     *  - There is no per-quality master: `?res=`/`?quality=`/`?max=` return a
+     *    byte-identical master and `7sop/playlist.m3u8` is 404.
+     *
+     * So each selectable quality is a variant playlist plus the audio and subtitle
+     * renditions attached as external tracks, which is what makes the quality list
+     * populate at all. The master is kept as a final "Auto" fallback; it muxes the
+     * audio itself, so it must **not** also receive the external audio track or the
+     * player ends up listing the same rendition twice (the external copy of an
+     * already-muxed track plays silent).
      */
     private fun videosFromMaster(masterUrl: String): List<Video> {
         val playbackHeaders = videoHeaders()
@@ -371,8 +522,8 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
             }
         }.getOrNull()
 
-        // Hand the master playlist straight to the player if the manifest cannot be
-        // read (for example a transient CDN error) - the player can parse it itself.
+        // Nothing to enrich with if the manifest cannot be read (transient CDN error):
+        // the player can still parse the master playlist itself.
         if (playlist.isNullOrBlank()) {
             return listOf(Video(masterUrl, "Auto", masterUrl, headers = playbackHeaders))
         }
@@ -381,21 +532,29 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
             val attributes = match.groupValues[1]
             val type = attributes.hlsAttr("TYPE") ?: return@mapNotNull null
             val uri = attributes.hlsAttr("URI") ?: return@mapNotNull null
-            val name = attributes.hlsAttr("NAME") ?: attributes.hlsAttr("LANGUAGE") ?: type
-            type to Track(masterUrl.resolveUri(uri), name)
+            Triple(type, masterUrl.resolveUri(uri), attributes)
         }.toList()
 
-        // The master ships audio renditions labelled with the site's default locale
-        // ("English"), but the actual language of the audio track is the original
-        // Japanese - so relabel it to what the track really is.
+        // The CDN tags the audio rendition `LANGUAGE="en",NAME="English"` on every
+        // title, but the audio is the original Japanese dub - so label it for what it
+        // actually is instead of forwarding the manifest's wrong name.
         val audioTracks = mediaTracks
             .filter { it.first == "AUDIO" }
-            .map { (_, track) -> Track(track.url, "Japanese") }
-        val subtitleTracks = mediaTracks.filter { it.first == "SUBTITLES" }.map { it.second }
+            .map { (_, url, _) -> Track(url, AUDIO_TRACK_NAME) }
 
-        val videos = STREAM_INF_REGEX.findAll(playlist).mapNotNull { match ->
+        // Subtitle renditions are named with a capitalised language code ("Ar", "Pt-br"),
+        // which is unhelpful in the track menu; resolve them to real language names.
+        val subtitleTracks = mediaTracks
+            .filter { it.first == "SUBTITLES" }
+            .map { (_, url, attributes) ->
+                Track(url, subtitleName(attributes.hlsAttr("LANGUAGE"), attributes.hlsAttr("NAME")))
+            }
+
+        val variants = STREAM_INF_REGEX.findAll(playlist).mapNotNull { match ->
             val attributes = match.groupValues[1]
-            val uri = match.groupValues[2].trim().ifEmpty { return@mapNotNull null }
+            val uri = match.groupValues[2].trim()
+                .takeIf { it.isNotBlank() && !it.startsWith("#") }
+                ?: return@mapNotNull null
             val videoUrl = masterUrl.resolveUri(uri)
             Video(
                 videoUrl,
@@ -407,18 +566,30 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
             )
         }.toList()
 
-        return videos.ifEmpty {
-            listOf(
-                Video(
-                    masterUrl,
-                    "Auto",
-                    masterUrl,
-                    headers = playbackHeaders,
-                    subtitleTracks = subtitleTracks,
-                    audioTracks = audioTracks,
-                ),
-            )
-        }
+        // "Auto" is the master playlist: it muxes the audio itself and lets the player
+        // drop to a lower rendition, which matters because the CDN throttles each
+        // segment request to roughly 215 KiB/s while the 720p variant needs ~254 KiB/s
+        // sustained - a fixed 720p selection runs the buffer dry on slower connections.
+        // It must not get the external audio track, or the same rendition is listed
+        // twice and the duplicate plays silent.
+        val auto = Video(
+            masterUrl,
+            "Auto",
+            masterUrl,
+            headers = playbackHeaders,
+            subtitleTracks = subtitleTracks,
+        )
+
+        return variants + auto
+    }
+
+    /** "ar" -> "Arabic", "pt-br" -> "Portuguese", falling back to the manifest's name. */
+    private fun subtitleName(language: String?, name: String?): String {
+        val display = language
+            ?.takeIf { it.isNotBlank() }
+            ?.let { Locale.forLanguageTag(it).getDisplayName(Locale.ENGLISH) }
+            ?.takeIf { it.isNotBlank() && !it.equals(language, ignoreCase = true) }
+        return display ?: name?.takeIf { it.isNotBlank() } ?: language ?: "Unknown"
     }
 
     /** "1280x720" -> "720p", falling back to the bitrate when there is no resolution. */
@@ -469,12 +640,33 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
 
     private companion object {
         private const val PREF_QUALITY_KEY = "preferred_quality"
-        private const val PREF_QUALITY_DEFAULT = "720p"
-        private val PREF_QUALITY_VALUES = arrayOf("1080p", "720p", "480p", "360p")
+
+        // Default to "Auto" (the master playlist): the CDN throttles every segment request
+        // to roughly 215 KiB/s, below the ~254 KiB/s the 720p rendition needs, so pinning
+        // 720p stalls once the initial buffer drains. Letting the player adapt keeps
+        // playback continuous, and a fixed rendition is still one tap away.
+        private const val PREF_QUALITY_DEFAULT = "Auto"
+
+        // "Auto" is the master playlist: the player picks the rendition itself, which is
+        // the better choice on a connection that cannot sustain the top variant.
+        private val PREF_QUALITY_VALUES = arrayOf("Auto", "1080p", "720p", "480p", "360p")
+
+        // The manifest always tags the single audio rendition as English even though the
+        // dub is Japanese, so the track menu gets an accurate label instead.
+        private const val AUDIO_TRACK_NAME = "Japanese"
+
+        // The ranking endpoint's only accepted periods (everything else is rejected
+        // with "Unsupported trending period").
+        private const val TRENDING_PERIOD_MONTHLY = "monthly"
+        private const val TRENDING_PERIOD_ALL = "all"
 
         private val SLUG_REGEX = Regex("""/watch/([^/]+)""")
         private val EPISODE_REGEX = Regex("""episode-(\d+)""")
         private val HEIGHT_REGEX = Regex("""(\d+)p""")
+
+        // Characters that may appear unescaped in a URL path (RFC 3986 pchar).
+        private val URL_PATH_SAFE_CHARS: Set<Char> =
+            (('a'..'z') + ('A'..'Z') + ('0'..'9') + "/-._~!\$&'()*+,;=:@".toList()).toSet()
 
         // Thumbnails live under /storage/<yyyy>/<MM>/<dd>/<slug-episode>/…
         private val THUMB_DATE_REGEX = Regex("""/storage/(\d{4}/\d{2}/\d{2})/""")
