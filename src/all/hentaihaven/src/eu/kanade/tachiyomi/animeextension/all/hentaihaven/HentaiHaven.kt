@@ -135,13 +135,29 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
         ?.replace(" ", "%20")
         ?.let { if (it.startsWith("http")) it else "$imageBaseUrl/${it.removePrefix("/")}" }
 
-    // ============================== Popular Anime ==============================
+    // ============================== Popular Anime (rebuilt) ==============================
 
+    /**
+     * Most-viewed titles. The CMS sorts by the `views` engagement counter; the
+     * response shape is identical to the plain catalogue.
+     */
     override fun popularAnimeRequest(page: Int): Request =
         catalogueRequest(page, sort = "views")
 
-    override fun popularAnimeParse(response: Response): AnimesPage =
-        parseCatalogue(response)
+    override fun popularAnimeParse(response: Response): AnimesPage {
+        val page = response.request.url.queryParameter("page")?.toIntOrNull() ?: 1
+        val root = json.parseToJsonElement(response.body.string()).jsonObject
+        root["error"]?.jsonPrimitive?.content?.let { error ->
+            throw Exception("HentaiHaven: $error")
+        }
+        val entries = root["data"]?.jsonArray ?: return AnimesPage(emptyList(), false)
+
+        val animeList = entries.mapNotNull { entry ->
+            runCatching { hitToAnime(entry.jsonObject) }.getOrNull()
+        }
+        val totalPages = root["totalPages"]?.jsonPrimitive?.content?.toIntOrNull() ?: 1
+        return AnimesPage(animeList, page < totalPages)
+    }
 
     // ============================== Latest Updates ==============================
 
@@ -369,7 +385,12 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
             type to Track(masterUrl.resolveUri(uri), name)
         }.toList()
 
-        val audioTracks = mediaTracks.filter { it.first == "AUDIO" }.map { it.second }
+        // The master ships audio renditions labelled with the site's default locale
+        // ("English"), but the actual language of the audio track is the original
+        // Japanese - so relabel it to what the track really is.
+        val audioTracks = mediaTracks
+            .filter { it.first == "AUDIO" }
+            .map { (_, track) -> Track(track.url, "Japanese") }
         val subtitleTracks = mediaTracks.filter { it.first == "SUBTITLES" }.map { it.second }
 
         val videos = STREAM_INF_REGEX.findAll(playlist).mapNotNull { match ->
