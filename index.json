@@ -21,10 +21,10 @@
   {
     "name": "HentaiHaven",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.hentaihaven",
-    "apk": "aniyomi-all.hentaihaven-v14.09-release.apk",
+    "apk": "aniyomi-all.hentaihaven-v14.10-release.apk",
     "lang": "all",
-    "code": 9,
-    "version": "14.09",
+    "code": 10,
+    "version": "14.10",
     "nsfw": 1,
     "hasReadme": 0,
     "hasChangelog": 0,
