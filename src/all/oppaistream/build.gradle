@@ -1,0 +1,9 @@
+ext {
+    extName = 'OppaiStream'
+    extLabel = 'OppaiStream (𝕬𝕽)'
+    extClass = '.OppaiStream'
+    extVersionCode = 1
+    isNsfw = true
+}
+
+apply from: "$rootDir/common.gradle"
