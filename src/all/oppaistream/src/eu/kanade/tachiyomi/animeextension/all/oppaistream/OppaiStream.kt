@@ -111,7 +111,13 @@ class OppaiStream : AnimeHttpSource() {
             img.attr("original").ifBlank { img.attr("src") }.ifBlank { null }
         }?.takeIf { it.startsWith("http") }
         val description = card.attr("desc").trim().ifBlank { null }
-        val tags = card.attr("tags").split(",").map { it.trim() }.filter { it.isNotBlank() }
+        // Case-insensitive de-dup: some titles list the same tag twice with different
+        // casing ("4K" and "4k"), and AniZen keys its genre chips on the lowercased tag,
+        // so a duplicate key crashes the details screen outright.
+        val tags = card.attr("tags").split(",")
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinctBy { it.lowercase() }
         val studio = card.selectFirst("a[href*='studio=']")?.text()?.trim()?.ifBlank { null }
         return EpisodeCard(seriesName, episode, watchPath, folder, thumbnail, description, tags, studio)
     }
@@ -125,7 +131,9 @@ class OppaiStream : AnimeHttpSource() {
                 url = first.watchPath
                 thumbnail_url = first.thumbnail
                 description = first.description
-                genre = first.tags.joinToString(", ").ifBlank { null }
+                // Dedup case-insensitively (see parseCard) — duplicate genre chips
+                // crash AniZen's details screen.
+                genre = first.tags.distinctBy { it.lowercase() }.joinToString(", ").ifBlank { null }
                 author = first.studio
                 status = SAnime.COMPLETED
                 initialized = true
@@ -242,7 +250,10 @@ class OppaiStream : AnimeHttpSource() {
         val description = card?.attr("desc")?.trim()?.ifBlank { null }
             ?: document.selectFirst("meta[name=description]")?.attr("content")
 
+        // Case-insensitive de-dup: a repeated tag under different casing ("4K"/"4k")
+        // collides in AniZen's genre-chip keys and crashes the details screen.
         val tags = card?.attr("tags")?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }
+            ?.distinctBy { it.lowercase() }
         val studio = card?.selectFirst("a[href*='studio=']")?.text()?.trim()?.ifBlank { null }
 
         return SAnime.create().apply {

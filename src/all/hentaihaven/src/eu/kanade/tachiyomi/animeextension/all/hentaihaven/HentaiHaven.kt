@@ -344,10 +344,12 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
 
             // Genres are the /series/ chips in the info block. Other /series/ links on
             // the page belong to related-title cards, hence the badge restriction.
+            // Case-insensitive de-dup: a repeated badge under different casing collides
+            // in AniZen's genre-chip keys and crashes the details screen.
             genre = document.select("a[data-slot=badge][href^=\"/series/\"]")
                 .map { it.text().trim() }
                 .filter { it.isNotBlank() }
-                .distinct()
+                .distinctBy { it.lowercase() }
                 .joinToString(", ")
                 .takeIf { it.isNotBlank() }
 
