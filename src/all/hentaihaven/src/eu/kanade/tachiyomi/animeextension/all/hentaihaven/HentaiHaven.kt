@@ -9,20 +9,14 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.put
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.jsoup.Jsoup
 import uy.kohesive.injekt.injectLazy
@@ -35,9 +29,8 @@ import uy.kohesive.injekt.injectLazy
  * /api/manga/ (params: page, per_page, search, sort, trending_period, live).
  * Genre listings are server-rendered pages at /series/<genre-slug>/.
  *
- * Video streams: POST /api/stream/ with the video slug + its CMS permalink
- * returns HLS manifests. The site sits behind Cloudflare, so requests go
- * through the app's cloudflareClient.
+ * Video streams: the watch page embeds an octopus stream UUID; the HLS
+ * manifest is served from octopusmanifest.org/{uuid}/playlist.m3u8.
  */
 class HentaiHaven : AnimeHttpSource() {
 
@@ -49,13 +42,9 @@ class HentaiHaven : AnimeHttpSource() {
 
     override val supportsLatest = true
 
-    override val client: OkHttpClient = network.cloudflareClient
-
     private val json: Json by injectLazy()
 
     private val catalogueApiUrl = "$baseUrl/api/manga/"
-    private val streamApiUrl = "$baseUrl/api/stream/"
-    private val cmsBaseUrl = "https://cms.hentaihaven.xxx"
     private val imageBaseUrl = "https://img.hentaihaven.xxx"
 
     private val pageSize = 24
@@ -166,16 +155,15 @@ class HentaiHaven : AnimeHttpSource() {
 
     private class SortFilter : AnimeFilter.Select<String>(
         "Sort by",
-        arrayOf("Most viewed", "Top rated", "Trending", "Newest", "Alphabetical"),
+        arrayOf("Default", "Most viewed", "Top rated", "Newest"),
         0,
     ) {
-        val sortValue: String
+        val sortValue: String?
             get() = when (state) {
-                1 -> "rating"
-                2 -> "trending"
+                1 -> "views"
+                2 -> "rating"
                 3 -> "latest"
-                4 -> "views"
-                else -> "alpha"
+                else -> null
             }
     }
 
@@ -293,59 +281,42 @@ class HentaiHaven : AnimeHttpSource() {
     // ============================== Video Streams ==============================
 
     override fun videoListRequest(episode: SEpisode): Request {
-        val slug = Regex("/watch/([^/]+)").find(episode.url)?.groupValues?.get(1)
-            ?: episode.url.trimEnd('/').substringAfterLast('/')
-        val payload = buildJsonObject {
-            put("slug", slug)
-            put("permalink", "$cmsBaseUrl/watch/$slug/")
-        }.toString()
-        val body = payload.toRequestBody("application/json".toMediaType())
-        return POST(streamApiUrl, headers, body)
+        // The watch page embeds the octopus stream UUID; fetch it so we can
+        // resolve the HLS manifest from octopusmanifest.org.
+        val url = if (episode.url.startsWith("http")) episode.url else "$baseUrl${episode.url}"
+        return GET(url, headers)
     }
 
     override fun videoListParse(response: Response): List<Video> {
         if (!response.isSuccessful) {
             throw Exception(
-                "HentaiHaven: failed to fetch stream manifest (HTTP ${response.code}). " +
+                "HentaiHaven: failed to fetch the watch page (HTTP ${response.code}). " +
                     "If this persists, the site's video CDN may be blocking your region.",
             )
         }
 
-        val root = json.parseToJsonElement(response.body.string()).jsonObject
-        if (root["status"]?.jsonPrimitive?.content != "true") {
-            throw Exception("HentaiHaven: no video sources available for this title")
-        }
-        val data = root["data"]?.jsonObject ?: return emptyList()
+        val html = response.body.string()
 
-        // Playback headers: the site's video CDN rejects non-browser clients,
-        // so send a full browser-like header set.
-        val videoHeaders = okhttp3.Headers.Builder()
-            .add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-            .add("Accept", "*/*")
-            .add("Accept-Language", "en-US,en;q=0.9")
-            .add("Referer", "$baseUrl/")
-            .add("Origin", baseUrl)
-            .build()
+        // The player config is embedded in the page's RSC payload as a UUID; the
+        // HLS manifest lives at octopusmanifest.org/{uuid}/playlist.m3u8. Every
+        // UUID on the page belongs to the current episode.
+        val uuid = Regex("[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+            .find(html)?.value
 
-        val videos = mutableListOf<Video>()
-        val seen = mutableSetOf<String>()
-
-        fun addSources(key: String) {
-            data[key]?.jsonArray?.forEach { sourceElem ->
-                val source = runCatching { sourceElem.jsonObject }.getOrNull() ?: return@forEach
-                val streamUrl = source["src"]?.jsonPrimitive?.content ?: return@forEach
-                if (streamUrl.isBlank() || !seen.add(streamUrl)) return@forEach
-                val label = source["label"]?.jsonPrimitive?.content ?: "Auto"
-                videos.add(Video(streamUrl, label, streamUrl, videoHeaders))
-            }
+        if (uuid != null) {
+            val streamUrl = "https://octopusmanifest.org/$uuid/playlist.m3u8"
+            return listOf(Video(streamUrl, "Auto", streamUrl, headers = videoHeaders()))
         }
 
-        addSources("sources")
-        addSources("fallbackSources")
-
-        if (videos.isEmpty()) throw Exception("HentaiHaven: no video sources available for this title")
-        return videos
+        throw Exception("HentaiHaven: no video source found for this episode")
     }
+
+    // Playback headers: the video CDN expects a browser-like Referer/Origin.
+    private fun videoHeaders(): Headers = headers.newBuilder()
+        .set("Referer", "$baseUrl/")
+        .set("Origin", baseUrl)
+        .add("Accept", "*/*")
+        .build()
 
     private companion object {
         // (slug, display name) pairs from the site's genre taxonomy (wp-manga-genre).
