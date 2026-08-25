@@ -40,10 +40,10 @@
   {
     "name": "OppaiStream (𝕬𝕽)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.oppaistream",
-    "apk": "aniyomi-all.oppaistream-v14.01-release.apk",
+    "apk": "aniyomi-all.oppaistream-v14.02-release.apk",
     "lang": "all",
-    "code": 1,
-    "version": "14.01",
+    "code": 2,
+    "version": "14.02",
     "nsfw": 1,
     "hasReadme": 0,
     "hasChangelog": 0,
