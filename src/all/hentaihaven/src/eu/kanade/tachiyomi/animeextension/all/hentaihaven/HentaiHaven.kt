@@ -11,7 +11,6 @@ import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
-import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
@@ -522,77 +521,42 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
      */
     private fun videosFromMaster(masterUrl: String): List<Video> {
         val playbackHeaders = videoHeaders()
+
+        // Last-resort entry: the raw master. Its audio muxes in-band, so sound always
+        // works, but mpv treats it as a live window and forward skips can stall.
+        val plainAuto = listOf(Video(masterUrl, "Auto", masterUrl, headers = playbackHeaders))
+
         val playlist = runCatching {
             client.newCall(GET(masterUrl, playbackHeaders)).execute().use { res ->
                 if (res.isSuccessful) res.body.string() else null
             }
         }.getOrNull()
+        if (playlist.isNullOrBlank()) return plainAuto
 
-        // Nothing to enrich with if the manifest cannot be read (transient CDN error):
-        // the player can still parse the master playlist itself.
-        if (playlist.isNullOrBlank()) {
-            return listOf(Video(masterUrl, "Auto", masterUrl, headers = playbackHeaders))
-        }
+        val uuid = UUID_REGEX.find(masterUrl)?.value ?: return plainAuto
 
-        val mediaTracks = MEDIA_REGEX.findAll(playlist).mapNotNull { match ->
-            val attributes = match.groupValues[1]
-            val type = attributes.hlsAttr("TYPE") ?: return@mapNotNull null
-            val uri = attributes.hlsAttr("URI") ?: return@mapNotNull null
-            Triple(type, masterUrl.resolveUri(uri), attributes)
-        }.toList()
-
-        // The CDN tags the audio rendition `LANGUAGE="en",NAME="English"` on every
-        // title, but the audio is the original Japanese dub - so label it for what it
-        // actually is instead of forwarding the manifest's wrong name.
-        val audioTracks = mediaTracks
-            .filter { it.first == "AUDIO" }
-            .map { (_, url, _) -> Track(url, AUDIO_TRACK_NAME) }
-
-        // Subtitle renditions are named with a capitalised language code ("Ar", "Pt-br"),
-        // which is unhelpful in the track menu; resolve them to real language names.
-        val subtitleTracks = mediaTracks
-            .filter { it.first == "SUBTITLES" }
-            .map { (_, url, attributes) ->
-                Track(url, subtitleName(attributes.hlsAttr("LANGUAGE"), attributes.hlsAttr("NAME")))
-            }
+        // Every fixed quality is served through a loopback VOD server: the chosen video
+        // variant and the Japanese audio rendition are re-joined into one normal VOD
+        // stream, so sound plays out of the box AND skipping ahead behaves like a file.
+        val server = runCatching {
+            HlsVodServer.forMaster(client, playbackHeaders, uuid, playlist)
+        }.getOrNull() ?: return plainAuto
 
         val variants = STREAM_INF_REGEX.findAll(playlist).mapNotNull { match ->
             val attributes = match.groupValues[1]
-            val uri = match.groupValues[2].trim()
+            match.groupValues[2].trim()
                 .takeIf { it.isNotBlank() && !it.startsWith("#") }
                 ?: return@mapNotNull null
-            val videoUrl = masterUrl.resolveUri(uri)
+            val label = attributes.qualityLabel()
             Video(
-                videoUrl,
-                attributes.qualityLabel(),
-                videoUrl,
+                url = server.vodUrl(label),
+                quality = label,
+                videoUrl = server.vodUrl(label),
                 headers = playbackHeaders,
-                subtitleTracks = subtitleTracks,
-                audioTracks = audioTracks,
             )
         }.toList()
 
-        // "Auto" is the master playlist: it muxes the audio in-band, so it is the only
-        // entry whose sound plays out of the box (mpv ships the external audio track
-        // toggle off by default). It is appended last so the default preference picks it.
-        val auto = Video(
-            masterUrl,
-            "Auto",
-            masterUrl,
-            headers = playbackHeaders,
-            subtitleTracks = subtitleTracks,
-        )
-
-        return variants + auto
-    }
-
-    /** "ar" -> "Arabic", "pt-br" -> "Portuguese", falling back to the manifest's name. */
-    private fun subtitleName(language: String?, name: String?): String {
-        val display = language
-            ?.takeIf { it.isNotBlank() }
-            ?.let { Locale.forLanguageTag(it).getDisplayName(Locale.ENGLISH) }
-            ?.takeIf { it.isNotBlank() && !it.equals(language, ignoreCase = true) }
-        return display ?: name?.takeIf { it.isNotBlank() } ?: language ?: "Unknown"
+        return variants.ifEmpty { plainAuto }
     }
 
     /** "1280x720" -> "720p", falling back to the bitrate when there is no resolution. */
@@ -644,17 +608,13 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
     private companion object {
         private const val PREF_QUALITY_KEY = "preferred_quality"
 
-        // Default to "Auto" (the master playlist) so sound plays out of the box: it muxes
-        // the audio in-band, which the player plays without any extra toggle.
-        private const val PREF_QUALITY_DEFAULT = "Auto"
+        // Every quality now plays through the loopback VOD server, which re-joins the
+        // video variant with the Japanese audio rendition as one normal VOD stream - so
+        // the highest quality is both watchable AND seekable. The raw master ("Auto")
+        // stays in the list purely as a fallback if the local server ever fails.
+        private const val PREF_QUALITY_DEFAULT = "1080p"
 
-        // "Auto" is the master; the fixed qualities carry the relabelled "Japanese"
-        // external audio track (which needs the player's external-audio toggle enabled).
-        private val PREF_QUALITY_VALUES = arrayOf("Auto", "1080p", "720p", "480p", "360p")
-
-        // The manifest always tags the single audio rendition as English even though the
-        // dub is Japanese, so the track menu gets an accurate label instead.
-        private const val AUDIO_TRACK_NAME = "Japanese"
+        private val PREF_QUALITY_VALUES = arrayOf("1080p", "720p", "480p", "360p", "Auto")
 
         // The ranking endpoint's only accepted periods (everything else is rejected
         // with "Unsupported trending period").
@@ -675,7 +635,6 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
         private val UUID_REGEX =
             Regex("""[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}""")
 
-        private val MEDIA_REGEX = Regex("""#EXT-X-MEDIA:(.+)""")
         private val STREAM_INF_REGEX = Regex("""#EXT-X-STREAM-INF:(.+)\r?\n(.+)""")
 
         private val DATE_FORMATTER by lazy {
