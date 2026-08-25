@@ -509,10 +509,16 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
      *
      * So each selectable quality is a variant playlist plus the audio and subtitle
      * renditions attached as external tracks, which is what makes the quality list
-     * populate at all. The master is kept as a final "Auto" fallback; it muxes the
-     * audio itself, so it must **not** also receive the external audio track or the
-     * player ends up listing the same rendition twice (the external copy of an
-     * already-muxed track plays silent).
+     * populate at all; the variants are video-only, so the "Japanese" external audio
+     * attaches cleanly and the audio rack gets the right label.
+     *
+     * The octopus "master" playlist is also offered, as "Auto". It muxes the audio
+     * in-band, so it is the only entry whose sound plays out of the box - mpv's player
+     * ships the external audio track toggle off by default, and a video-only variant
+     * with no enabled audio is silent. That in-band track cannot be relabelled, which
+     * is why "Auto" keeps the manifest's own track while the fixed qualities are
+     * labelled correctly; on the phone the muxed track shows as the site's default name
+     * ("#1: Proudly served by MuchoHentai.com") which is what the site itself calls it.
      */
     private fun videosFromMaster(masterUrl: String): List<Video> {
         val playbackHeaders = videoHeaders()
@@ -566,12 +572,9 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
             )
         }.toList()
 
-        // "Auto" is the master playlist: it muxes the audio itself and lets the player
-        // drop to a lower rendition, which matters because the CDN throttles each
-        // segment request to roughly 215 KiB/s while the 720p variant needs ~254 KiB/s
-        // sustained - a fixed 720p selection runs the buffer dry on slower connections.
-        // It must not get the external audio track, or the same rendition is listed
-        // twice and the duplicate plays silent.
+        // "Auto" is the master playlist: it muxes the audio in-band, so it is the only
+        // entry whose sound plays out of the box (mpv ships the external audio track
+        // toggle off by default). It is appended last so the default preference picks it.
         val auto = Video(
             masterUrl,
             "Auto",
@@ -641,14 +644,12 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
     private companion object {
         private const val PREF_QUALITY_KEY = "preferred_quality"
 
-        // Default to "Auto" (the master playlist): the CDN throttles every segment request
-        // to roughly 215 KiB/s, below the ~254 KiB/s the 720p rendition needs, so pinning
-        // 720p stalls once the initial buffer drains. Letting the player adapt keeps
-        // playback continuous, and a fixed rendition is still one tap away.
+        // Default to "Auto" (the master playlist) so sound plays out of the box: it muxes
+        // the audio in-band, which the player plays without any extra toggle.
         private const val PREF_QUALITY_DEFAULT = "Auto"
 
-        // "Auto" is the master playlist: the player picks the rendition itself, which is
-        // the better choice on a connection that cannot sustain the top variant.
+        // "Auto" is the master; the fixed qualities carry the relabelled "Japanese"
+        // external audio track (which needs the player's external-audio toggle enabled).
         private val PREF_QUALITY_VALUES = arrayOf("Auto", "1080p", "720p", "480p", "360p")
 
         // The manifest always tags the single audio rendition as English even though the
