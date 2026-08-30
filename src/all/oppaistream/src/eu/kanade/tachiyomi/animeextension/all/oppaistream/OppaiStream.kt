@@ -58,12 +58,13 @@ class OppaiStream : AnimeHttpSource() {
         genres: List<String> = emptyList(),
         blacklist: List<String> = emptyList(),
         studio: String? = null,
+        limit: Int = pageSize,
     ): Request {
         val url = "$baseUrl/actions/search.php".toHttpUrl().newBuilder().apply {
             addQueryParameter("text", search.orEmpty())
             addQueryParameter("order", sort.orEmpty())
             addQueryParameter("page", page.toString())
-            addQueryParameter("limit", pageSize.toString())
+            addQueryParameter("limit", limit.toString())
             addQueryParameter("genres", genres.joinToString(","))
             addQueryParameter("blacklist", blacklist.joinToString(","))
             addQueryParameter("studio", studio.orEmpty())
@@ -170,12 +171,15 @@ class OppaiStream : AnimeHttpSource() {
             }
         }
         val sort = flatFilters.filterIsInstance<SortFilter>().firstOrNull()?.sortValue
+        // Genres must be sent as the site's slugs ("mindbreak"), not the
+        // lowercased display names ("mind break") - the API returns zero
+        // results for multi-word display names.
         val includedGenres = flatFilters.filterIsInstance<GenreFilter>()
             .filter { it.state == AnimeFilter.TriState.STATE_INCLUDE }
-            .map { it.name.lowercase() }
+            .map { genreValue(it.name) }
         val excludedGenres = flatFilters.filterIsInstance<GenreFilter>()
             .filter { it.state == AnimeFilter.TriState.STATE_EXCLUDE }
-            .map { it.name.lowercase() }
+            .map { genreValue(it.name) }
         val studio = flatFilters.filterIsInstance<StudioFilter>()
             .firstOrNull { it.state == AnimeFilter.TriState.STATE_INCLUDE }
             ?.name
@@ -188,6 +192,11 @@ class OppaiStream : AnimeHttpSource() {
             studio = studio,
         )
     }
+
+    /** Maps a genre filter's display name back to the site's genre slug. */
+    private fun genreValue(display: String): String =
+        GENRE_LIST.firstOrNull { it.second.equals(display, ignoreCase = true) }?.first
+            ?: display.lowercase().replace(" ", "")
 
     override fun searchAnimeParse(response: Response): AnimesPage =
         popularAnimeParse(response)
@@ -237,7 +246,7 @@ class OppaiStream : AnimeHttpSource() {
         val document = Jsoup.parse(response.body.string(), baseUrl)
         val card = document.selectFirst("div.episode-shown")
 
-        val title = card?.attr("name")?.trim()
+        val title = card?.attr("name")?.trim()?.ifBlank { null }
             ?: document.selectFirst("meta[property=og:title]")?.attr("content")
                 ?.substringBefore(" EP ")?.substringBefore(" in HD")
             ?: ""
@@ -271,8 +280,9 @@ class OppaiStream : AnimeHttpSource() {
 
     override fun episodeListRequest(anime: SAnime): Request {
         // Re-query the search API with the series title; it returns every
-        // episode card of that series (the watch page only shows ~6).
-        return catalogueRequest(1, search = anime.title, sort = null)
+        // episode card of that series (the watch page only shows ~6). Use a
+        // high limit so long series (>24 episodes) are not truncated.
+        return catalogueRequest(1, search = anime.title, sort = null, limit = 100)
     }
 
     override fun episodeListParse(response: Response): List<SEpisode> {
@@ -320,30 +330,49 @@ class OppaiStream : AnimeHttpSource() {
         //   vsource = { "r-720":"...", "r-1080":"", "r-4k":"" };
         //   if("true" == "true") { vsource["r-1080"] = "..."; }
         //   if("" == "true")     { vsource["r-4k"] = "..."; }
+        // Note the 4K key is "r-4k" (letters, not digits) - matching on \d+
+        // silently hid every 4K stream even when the site serves it.
         val available = mutableListOf("720")
         val dashUrls = mutableMapOf<String, String>()
         // Base object literal:   "r-720":"...", "r-1080":"", "r-4k":""
-        Regex(""""r-(\d+)":\s*"([^"]*)"""")
+        Regex(""""r-(\w+)":\s*"([^"]*)"""")
             .findAll(html)
             .forEach { m ->
                 val res = m.groupValues[1]
                 val url = m.groupValues[2]
                 if (url.isNotBlank()) dashUrls[res] = url
             }
-        // Availability guards:   if("true" == "true") { vsource["r-1080"] = "..." }
-        Regex("""vsource\["r-(\d+)"]\s*=\s*"([^"]*)"""")
+        // Guarded assignments (only "true" guards signal availability):
+        //   if("true" == "true") { vsource["r-1080"] = "..."; }
+        // The assignment line is present in the HTML even when the guard is
+        // false, so only guards of the form if("true" == "true") count -
+        // otherwise we would list entries that 404 on the CDN.
+        Regex("""if\("([^"]*)" == "true"\)\s*\{\s*vsource\["r-(\w+)"\]\s*=\s*"([^"]*)"""")
             .findAll(html)
             .forEach { m ->
-                val res = m.groupValues[1]
-                val url = m.groupValues[2]
-                if (url.isNotBlank()) dashUrls[res] = url
+                val guard = m.groupValues[1]
+                val res = m.groupValues[2]
+                val url = m.groupValues[3]
+                if (guard == "true" && url.isNotBlank()) {
+                    dashUrls[res] = url
+                    if (!available.contains(res)) available.add(res)
+                }
             }
-        Regex("""if\("true" == "true"\)\s*\{\s*vsource\["r-(\d+)"]""")
-            .findAll(html)
-            .forEach { m ->
-                val res = m.groupValues[1]
-                if (!available.contains(res)) available.add(res)
-            }
+
+        // Authoritative MP4 map published by the page:
+        //   var availableres = {"720":"https:\/\/...\/720\/E01.mp4","1080":"..."};
+        // Preferred over reconstructing URLs: hosts/filenames can differ per
+        // resolution (e.g. 1080p served as E01.webm) and the guard list does
+        // not reflect MP4 reality.
+        val mp4Urls = linkedMapOf<String, String>()
+        Regex("""availableres\s*=\s*\{([^}]*)\}""").find(html)?.let { m ->
+            Regex(""""(\w+)"\s*:\s*"([^"]*)"""")
+                .findAll(m.groupValues[1])
+                .forEach { e ->
+                    val url = e.groupValues[2].replace("\\/", "/")
+                    if (url.isNotBlank()) mp4Urls[e.groupValues[1]] = url
+                }
+        }
 
         val videos = mutableListOf<Video>()
         val videoHeaders = videoHeaders()
@@ -352,23 +381,41 @@ class OppaiStream : AnimeHttpSource() {
         // 4K encodes are sometimes VP9 level 5.x (e.g. Harem-tou e Youkoso!),
         // which hard-crashes the native decoder on many devices, so those are probed and dropped.
         dashUrls.entries
-            .sortedByDescending { it.key.toIntOrNull() ?: 0 }
+            .sortedByDescending { resWeight(it.key) }
             .forEach { (res, url) ->
                 val mpd = url.replace(" ", "%20")
                 if (isDecodableMpd(mpd)) {
-                    videos += Video(mpd, "${res}p (DASH)", mpd, headers = videoHeaders)
+                    videos += Video(mpd, "${resLabel(res)} (DASH)", mpd, headers = videoHeaders)
                 }
             }
 
         // Direct MP4s at each available resolution (fallback, most compatible).
-        available.sortedByDescending { it.toIntOrNull() ?: 0 }.forEach { res ->
-            val mp4 = "https://myspacecat.pictures/$folder/$res/$epFile"
-                .replace(" ", "%20")
-            videos += Video(mp4, "${res}p", mp4, headers = videoHeaders)
+        if (mp4Urls.isNotEmpty()) {
+            mp4Urls.entries
+                .sortedByDescending { resWeight(it.key) }
+                .forEach { (res, url) ->
+                    videos += Video(url, resLabel(res), url, headers = videoHeaders)
+                }
+        } else {
+            available.sortedByDescending { resWeight(it) }.forEach { res ->
+                val mp4 = "https://myspacecat.pictures/$folder/$res/$epFile"
+                    .replace(" ", "%20")
+                videos += Video(mp4, resLabel(res), mp4, headers = videoHeaders)
+            }
         }
 
         return videos.distinctBy { it.url }
     }
+
+    /** Sort weight for a resolution key ("720"/"1080"/"4k" - 4K sorts highest). */
+    private fun resWeight(res: String): Int = when (res) {
+        "4k" -> 2160
+        else -> res.toIntOrNull() ?: 0
+    }
+
+    /** Display label for a resolution key ("720" -> "720p", "4k" -> "4K"). */
+    private fun resLabel(res: String): String =
+        if (res.equals("4k", ignoreCase = true)) "4K" else "${res}p"
 
     // Playback headers: the video CDN expects a browser-like Referer/Origin.
     private fun videoHeaders(): Headers = headers.newBuilder()
@@ -384,7 +431,10 @@ class OppaiStream : AnimeHttpSource() {
      */
     private fun isDecodableMpd(mpdUrl: String): Boolean = runCatching {
         val body = client.newCall(GET(mpdUrl, videoHeaders())).execute().use { resp ->
-            if (!resp.isSuccessful) return@runCatching true
+            // A 404 here means the manifest does not exist (e.g. 4K entries the
+            // page's JS hints at but never enables) - drop the entry instead of
+            // surfacing a video that always fails to play.
+            if (!resp.isSuccessful) return@runCatching false
             resp.body.string()
         }
         val vp9Level = Regex("""codecs="vp09\.\d+\.(\d+)\.\d+"""")
