@@ -442,6 +442,10 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
                     name = "Episode $number"
                     episode_number = number.toFloat()
                     date_upload = anchor.episodeDate()
+                    // Episode card thumbnails come from coverlanyvd.org storage.
+                    anchor.selectFirst("img[src]")?.attr("src")
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { setEpisodeField(this, "thumbnail_url", it) }
                 }
             }
             .groupBy { it.url }
@@ -583,6 +587,22 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
 
     private fun String.videoHeight(): Int =
         HEIGHT_REGEX.find(this)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+
+    /**
+     * Sets a field on SEpisode that exists in AniZen's runtime (lib v16+)
+     * but not in the lib-14 stub this extension compiles against.
+     */
+    private fun setEpisodeField(episode: SEpisode, fieldName: String, value: String) {
+        try {
+            val setter = episode.javaClass.getMethod(
+                "set${fieldName.replaceFirstChar { it.uppercase() }}",
+                String::class.java,
+            )
+            setter.invoke(episode, value)
+        } catch (_: NoSuchMethodException) {
+        } catch (_: Exception) {
+        }
+    }
 
     // Playback headers: the video CDN expects a browser-like Referer/Origin.
     private fun videoHeaders(): Headers = headers.newBuilder()

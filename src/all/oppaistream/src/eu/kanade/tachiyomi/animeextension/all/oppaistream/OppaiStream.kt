@@ -297,6 +297,10 @@ class OppaiStream : AnimeHttpSource() {
                     url = card.watchPath
                     name = "Episode ${card.episode}"
                     episode_number = card.episode.toFloat()
+                    // Episode thumbnails from the site's cover images.
+                    card.thumbnail?.takeIf { it.isNotBlank() }?.let {
+                        setEpisodeField(this, "thumbnail_url", it)
+                    }
                 }
             }
     }
@@ -416,6 +420,22 @@ class OppaiStream : AnimeHttpSource() {
     /** Display label for a resolution key ("720" -> "720p", "4k" -> "4K"). */
     private fun resLabel(res: String): String =
         if (res.equals("4k", ignoreCase = true)) "4K" else "${res}p"
+
+    /**
+     * Sets a field on SEpisode that exists in AniZen's runtime (lib v16+)
+     * but not in the lib-14 stub this extension compiles against.
+     */
+    private fun setEpisodeField(episode: SEpisode, fieldName: String, value: String) {
+        try {
+            val setter = episode.javaClass.getMethod(
+                "set${fieldName.replaceFirstChar { it.uppercase() }}",
+                String::class.java,
+            )
+            setter.invoke(episode, value)
+        } catch (_: NoSuchMethodException) {
+        } catch (_: Exception) {
+        }
+    }
 
     // Playback headers: the video CDN expects a browser-like Referer/Origin.
     private fun videoHeaders(): Headers = headers.newBuilder()
