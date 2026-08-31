@@ -573,9 +573,6 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
             ?.let { it.groupValues[1].ifEmpty { it.groupValues[2] } }
             ?.takeIf { it.isNotBlank() }
 
-    private fun String.resolveUri(uri: String): String =
-        if (uri.startsWith("http")) uri else toHttpUrl().resolve(uri)?.toString() ?: uri
-
     override fun List<Video>.sort(): List<Video> {
         val preferred = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT)!!
         return sortedWith(

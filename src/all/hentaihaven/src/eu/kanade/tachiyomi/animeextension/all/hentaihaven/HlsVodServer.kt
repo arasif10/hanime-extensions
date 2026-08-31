@@ -200,10 +200,16 @@ internal class HlsVodServer(
                 else -> out.append('\n')
             }
         }
-        val result = out.toString()
-            .replaceFirst("#EXT-X-VERSION:", "#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-VERSION:")
-            .trimEnd() + "\n#EXT-X-ENDLIST\n"
-        return Triple(200, result.toByteArray(), M3U8)
+        // The upstream playlist already carries #EXT-X-PLAYLIST-TYPE:VOD in most
+        // cases, so only inject it when missing. Duplicating the tag confuses mpv.
+        var result = out.toString().trimEnd()
+        if (!result.contains("#EXT-X-PLAYLIST-TYPE:VOD")) {
+            result = result.replaceFirst("#EXT-X-VERSION:", "#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-VERSION:")
+        }
+        if (!result.contains("#EXT-X-ENDLIST")) {
+            result += "\n#EXT-X-ENDLIST"
+        }
+        return Triple(200, "$result\n".toByteArray(), M3U8)
     }
 
     private fun proxySegment(url: String): Triple<Int, ByteArray, String> {
@@ -260,7 +266,9 @@ internal class HlsVodServer(
         url.endsWith(".m3u8") -> M3U8
         url.endsWith(".ts") -> "video/mp2t"
         url.endsWith(".vtt") -> "text/vtt"
-        url.endsWith(".mp4") || url.endsWith(".m4s") || url.endsWith(".m4a") -> "video/mp4"
+        // The CDN disguises fMP4 segments as .html to dodge hotlink checks.
+        url.endsWith(".mp4") || url.endsWith(".m4s") || url.endsWith(".m4a") ||
+            url.endsWith(".html") -> "video/mp4"
         else -> "application/octet-stream"
     }
 
