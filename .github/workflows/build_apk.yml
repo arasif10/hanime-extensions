@@ -11,7 +11,6 @@ env:
   KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
   KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
   ALIAS: ${{ secrets.ALIAS }}
-  EXTENSIONS_REPO_TOKEN: ${{ secrets.EXTENSIONS_REPO_TOKEN }}
 
 jobs:
   build:
@@ -56,35 +55,31 @@ jobs:
           path: '**/build/outputs/apk/**/*.apk'
 
   publish:
-    # Publish the freshly built APKs to the public arasif10/hanime-extensions repo so
-    # AniZen users can update. Needs EXTENSIONS_REPO_TOKEN (a PAT with write
-    # access to arasif10/hanime-extensions) stored in this repo's secrets. Steps are
-    # gated on it so the job no-ops (skipped) until the secret is configured -
-    # job-level "if" cannot reference secrets, so it is exposed via env instead.
+    # Publish the freshly built APKs to this repo's own "repo" branch, which is what
+    # AniZen reads. Uses the built-in GITHUB_TOKEN (no PAT needed) since the target is
+    # this same repository.
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
 
       - name: Download built APKs
         uses: actions/download-artifact@v4
-        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
         with:
           name: extension-apk
           path: apks
 
-      - name: Clone extensions repo
-        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
+      - name: Clone the repo branch
         run: |
           git clone --quiet --branch repo \
-            "https://x-access-token:${EXTENSIONS_REPO_TOKEN}@github.com/arasif10/hanime-extensions.git" \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
             extensions-repo
 
       - name: Collect extension icons
-        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
         run: |
           mkdir -p icons
           for dir in src/all/*/; do
@@ -97,5 +92,4 @@ jobs:
           ls -la icons
 
       - name: Publish APKs and update index
-        if: ${{ env.EXTENSIONS_REPO_TOKEN != '' }}
         run: python .github/publish_extensions.py --apk-dir apks --extensions-repo extensions-repo --icons-dir icons
