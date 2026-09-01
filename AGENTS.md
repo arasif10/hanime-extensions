@@ -105,3 +105,9 @@ Each repo has two branches:
   source is missing from `main` — do not rebuild/re-publish ReAnime until its
   source is restored to `src/en/reanime/`, then keep `extVersionCode = 1` so
   the broken debug build is replaced like-for-like.
+- 2026-09-01: the old private dev monorepo `arasif10/anime-repo` (177 commits,
+  all 5 extensions' sources, obsolete monorepo CI) has been archived into
+  `anime-extensions` as branches `archive/anime-repo-main` and
+  `archive/anime-repo-publish`. Its unique feature (--only filter in
+  publish_extensions.py) was ported to this repo. The private repo was then
+  deleted. Never re-create a private dev copy or publish from it.
