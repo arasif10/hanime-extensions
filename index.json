@@ -1,6 +1,6 @@
 [
   {
-    "name": "Hanime (𝕬𝕽)",
+    "name": "Hanime (\ud835\udd6c\ud835\udd7d)",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.hanime",
     "apk": "aniyomi-all.hanime-v14.28-release.apk",
     "lang": "all",
@@ -38,7 +38,7 @@
     ]
   },
   {
-    "name": "OppaiStream (𝕬𝕽)",
+    "name": "OppaiStream",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.oppaistream",
     "apk": "aniyomi-all.oppaistream-v14.06-release.apk",
     "lang": "all",
