@@ -443,9 +443,11 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
                     episode_number = number.toFloat()
                     date_upload = anchor.episodeDate()
                     // Episode card thumbnails come from coverlanyvd.org storage.
+                    // AniZen's runtime SEpisode exposes these via preview_url
+                    // (there is no episode-level thumbnail_url field).
                     anchor.selectFirst("img[src]")?.attr("src")
                         ?.takeIf { it.isNotBlank() }
-                        ?.let { setEpisodeField(this, "thumbnail_url", it) }
+                        ?.let { setEpisodeField(this, "preview_url", it) }
                 }
             }
             .groupBy { it.url }

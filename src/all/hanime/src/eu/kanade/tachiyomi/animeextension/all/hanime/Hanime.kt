@@ -742,6 +742,13 @@ class Hanime : AnimeHttpSource() {
                     url = "/videos/hentai/$epSlug"
                     // The API returns unix seconds; date_upload is epoch millis.
                     date_upload = (releaseDates[epSlug] ?: 0L) * 1000
+                    // Episode cards carry that video's own cover image; action
+                    // buttons (playlist/download/report) don't, so only real
+                    // cards get a preview. AniZen's runtime SEpisode exposes it
+                    // via preview_url (no episode-level thumbnail_url field).
+                    element.selectFirst("img[src]")?.attr("src")
+                        ?.takeIf { it.startsWith("http") }
+                        ?.let { setEpisodeField(this, "preview_url", it) }
                 },
             )
         }
@@ -764,6 +771,23 @@ class Hanime : AnimeHttpSource() {
     }
 
     // ============================== Video Streams ==============================
+
+    /**
+     * Sets a field on SEpisode that exists in AniZen's runtime (preview_url,
+     * summary) but not in the lib-14 stub this extension compiles against.
+     */
+    private fun setEpisodeField(episode: SEpisode, fieldName: String, value: String) {
+        try {
+            val setter = episode.javaClass.getMethod(
+                "set${fieldName.replaceFirstChar { it.uppercase() }}",
+                String::class.java,
+            )
+            setter.invoke(episode, value)
+        } catch (_: NoSuchMethodException) {
+        } catch (_: Exception) {
+        }
+    }
+
     private val handshakeUrl = "https://auth.hanime.tv/api/v11/handshake"
     private val handshakeSecret = "htv-insecure-handshake-v1"
     private val handshakeAad = "htv-insecure-v1"

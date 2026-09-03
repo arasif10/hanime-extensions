@@ -2,7 +2,7 @@ ext {
     extName = 'OppaiStream'
     extLabel = 'OppaiStream'
     extClass = '.OppaiStream'
-    extVersionCode = 6
+    extVersionCode = 7
     isNsfw = true
 }
 

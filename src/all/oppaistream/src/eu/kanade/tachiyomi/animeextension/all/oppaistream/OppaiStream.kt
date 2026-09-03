@@ -297,9 +297,15 @@ class OppaiStream : AnimeHttpSource() {
                     url = card.watchPath
                     name = "Episode ${card.episode}"
                     episode_number = card.episode.toFloat()
-                    // Episode thumbnails from the site's cover images.
+                    // Episode covers from the site's card images. AniZen's
+                    // runtime SEpisode exposes them via preview_url (there is
+                    // no episode-level thumbnail_url field).
                     card.thumbnail?.takeIf { it.isNotBlank() }?.let {
-                        setEpisodeField(this, "thumbnail_url", it)
+                        setEpisodeField(this, "preview_url", it)
+                    }
+                    // Per-episode synopsis, when the card carries one.
+                    card.description?.takeIf { it.isNotBlank() }?.let {
+                        setEpisodeField(this, "summary", it)
                     }
                 }
             }
