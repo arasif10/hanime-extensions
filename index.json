@@ -74,5 +74,24 @@
         "baseUrl": "https://hstream.moe"
       }
     ]
+  },
+  {
+    "name": "HentaiMama",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.hentaimama",
+    "apk": "aniyomi-all.hentaimama-v14.01-release.apk",
+    "lang": "all",
+    "code": 1,
+    "version": "14.01",
+    "nsfw": 1,
+    "hasReadme": 0,
+    "hasChangelog": 0,
+    "sources": [
+      {
+        "id": 4792016095198521599,
+        "lang": "all",
+        "name": "HentaiMama",
+        "baseUrl": "https://hentaimama.io"
+      }
+    ]
   }
 ]
