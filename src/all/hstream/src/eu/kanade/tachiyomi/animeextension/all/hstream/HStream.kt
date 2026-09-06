@@ -283,6 +283,20 @@ class HStream : AnimeHttpSource() {
 
         val apiResponse = client.newCall(playerApiRequest(episodeId)).execute()
         apiResponse.use {
+            // 419 = CSRF token mismatch: the token we sent didn't match what the
+            // session expects (usually a double-decoded or rotated cookie).
+            // Re-seed cookies with a fresh watch-page visit and try once more.
+            if (it.code == 419) {
+                // Re-seed cookies with a fresh watch-page visit, then retry once.
+                client.newCall(response.request).execute().close()
+                val retry = client.newCall(playerApiRequest(episodeId)).execute()
+                retry.use { r2 ->
+                    if (!r2.isSuccessful) {
+                        throw IOException("HStream: /player/api failed after retry (HTTP ${r2.code})")
+                    }
+                    return parseStreamJson(r2.body?.string().orEmpty())
+                }
+            }
             if (!it.isSuccessful) {
                 throw IOException("HStream: /player/api failed (HTTP ${it.code})")
             }
@@ -292,9 +306,19 @@ class HStream : AnimeHttpSource() {
 
     /** Mirrors the site's axios call: JSON body + CSRF + XHR headers. */
     private fun playerApiRequest(episodeId: String): Request {
-        val xsrf = client.cookieJar.loadForRequest("$baseUrl/".toHttpUrl())
+        val raw = client.cookieJar.loadForRequest("$baseUrl/".toHttpUrl())
             .firstOrNull { it.name == "XSRF-TOKEN" }?.value
             ?: throw IOException("HStream: XSRF-TOKEN cookie missing (watch page did not seed it)")
+
+        // Laravel expects the DECODED cookie value in X-XSRF-TOKEN. AniZen's
+        // cookie jar may hand us either the raw (percent-encoded) value or the
+        // decoded one, and an extra decode corrupts every '+' into a space
+        // ("CSRF token mismatch" / HTTP 419). Only decode when still encoded.
+        val token = if (raw.contains('%')) {
+            runCatching { java.net.URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
+        } else {
+            raw
+        }
 
         val body = """{"episode_id": "$episodeId"}"""
             .toRequestBody("application/json; charset=utf-8".toMediaType())
@@ -303,7 +327,7 @@ class HStream : AnimeHttpSource() {
             .url("$baseUrl/player/api")
             .post(body)
             .addHeader("X-Requested-With", "XMLHttpRequest")
-            .addHeader("X-XSRF-TOKEN", java.net.URLDecoder.decode(xsrf, "UTF-8"))
+            .addHeader("X-XSRF-TOKEN", token)
             .headers(headers)
             .build()
     }

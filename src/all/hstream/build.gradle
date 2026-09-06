@@ -2,7 +2,7 @@ ext {
     extName = 'HStream'
     extLabel = 'HStream'
     extClass = '.HStream'
-    extVersionCode = 1
+    extVersionCode = 2
     isNsfw = true
 }
 
