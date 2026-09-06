@@ -59,10 +59,10 @@
   {
     "name": "HStream",
     "pkg": "eu.kanade.tachiyomi.animeextension.all.hstream",
-    "apk": "aniyomi-all.hstream-v14.01-release.apk",
+    "apk": "aniyomi-all.hstream-v14.02-release.apk",
     "lang": "all",
-    "code": 1,
-    "version": "14.01",
+    "code": 2,
+    "version": "14.02",
     "nsfw": 1,
     "hasReadme": 0,
     "hasChangelog": 0,
