@@ -268,7 +268,8 @@ class HStream : AnimeHttpSource() {
     // ============================== Video Streams ==============================
 
     override fun videoListRequest(episode: SEpisode): Request {
-        // The watch page - also the request that seeds the XSRF-TOKEN cookie.
+        // The watch page. Its Set-Cookie headers carry the session + XSRF
+        // cookies that /player/api needs (see videoListParse).
         val slug = episode.url.substringAfter("/hentai/")
         return GET("$baseUrl/hentai/$slug", headers)
     }
@@ -281,22 +282,11 @@ class HStream : AnimeHttpSource() {
         val episodeId = document.selectFirst("input#e_id")?.attr("value")
             ?: throw IOException("HStream: episode id not found on the watch page")
 
-        val apiResponse = client.newCall(playerApiRequest(episodeId)).execute()
+        // Build the POST using the cookies from THIS response's Set-Cookie
+        // headers. AniZen's shared cookie jar does not reliably carry the
+        // Laravel session between requests, so we pass them explicitly.
+        val apiResponse = client.newCall(playerApiRequest(episodeId, response)).execute()
         apiResponse.use {
-            // 419 = CSRF token mismatch: the token we sent didn't match what the
-            // session expects (usually a double-decoded or rotated cookie).
-            // Re-seed cookies with a fresh watch-page visit and try once more.
-            if (it.code == 419) {
-                // Re-seed cookies with a fresh watch-page visit, then retry once.
-                client.newCall(response.request).execute().close()
-                val retry = client.newCall(playerApiRequest(episodeId)).execute()
-                retry.use { r2 ->
-                    if (!r2.isSuccessful) {
-                        throw IOException("HStream: /player/api failed after retry (HTTP ${r2.code})")
-                    }
-                    return parseStreamJson(r2.body?.string().orEmpty())
-                }
-            }
             if (!it.isSuccessful) {
                 throw IOException("HStream: /player/api failed (HTTP ${it.code})")
             }
@@ -304,31 +294,39 @@ class HStream : AnimeHttpSource() {
         }
     }
 
-    /** Mirrors the site's axios call: JSON body + CSRF + XHR headers. */
-    private fun playerApiRequest(episodeId: String): Request {
-        val raw = client.cookieJar.loadForRequest("$baseUrl/".toHttpUrl())
-            .firstOrNull { it.name == "XSRF-TOKEN" }?.value
-            ?: throw IOException("HStream: XSRF-TOKEN cookie missing (watch page did not seed it)")
+    /** Mirrors the site's axios call: JSON body + session cookies + CSRF + XHR headers. */
+    private fun playerApiRequest(episodeId: String, watchResponse: Response): Request {
+        var xsrf: String? = null
+        val cookieParts = mutableListOf<String>()
+        watchResponse.headers.values("Set-Cookie").forEach { sc ->
+            val name = sc.substringBefore('=').trim()
+            val value = sc.substringAfter('=').substringBefore(';')
+            if (name == "XSRF-TOKEN") xsrf = value
+            cookieParts += "$name=$value"
+        }
+        val token = xsrf ?: throw IOException("HStream: XSRF-TOKEN cookie missing (watch page did not seed it)")
 
-        // Laravel expects the DECODED cookie value in X-XSRF-TOKEN. AniZen's
-        // cookie jar may hand us either the raw (percent-encoded) value or the
-        // decoded one, and an extra decode corrupts every '+' into a space
-        // ("CSRF token mismatch" / HTTP 419). Only decode when still encoded.
-        val token = if (raw.contains('%')) {
-            runCatching { java.net.URLDecoder.decode(raw, "UTF-8") }.getOrDefault(raw)
+        // Laravel expects the DECODED cookie value in X-XSRF-TOKEN; only decode
+        // when it is still percent-encoded (decoding an already-decoded value
+        // turns every '+' into a space -> HTTP 419).
+        val decoded = if (token.contains('%')) {
+            runCatching { java.net.URLDecoder.decode(token, "UTF-8") }.getOrDefault(token)
         } else {
-            raw
+            token
         }
 
         val body = """{"episode_id": "$episodeId"}"""
             .toRequestBody("application/json; charset=utf-8".toMediaType())
 
+        // NB: .headers() REPLACES the whole header set, so base headers must
+        // come FIRST - anything added after it would be silently dropped.
         return Request.Builder()
             .url("$baseUrl/player/api")
+            .headers(headers)
             .post(body)
             .addHeader("X-Requested-With", "XMLHttpRequest")
-            .addHeader("X-XSRF-TOKEN", token)
-            .headers(headers)
+            .addHeader("X-XSRF-TOKEN", decoded)
+            .addHeader("Cookie", cookieParts.joinToString("; "))
             .build()
     }
 
