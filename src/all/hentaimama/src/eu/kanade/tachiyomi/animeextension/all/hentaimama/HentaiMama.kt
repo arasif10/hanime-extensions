@@ -181,6 +181,40 @@ class HentaiMama : AnimeHttpSource() {
         }
     }
 
+    // ============================== Recommendations ======================
+    // AniZen fills the "Recommended" row of its detail screen only when the
+    // extension advertises support and implements `fetchRelatedAnimeList`.
+    // Those members exist on AniZen's runtime source API but not on the older
+    // lib-14 stub we compile against, so they are declared without `override`
+    // — the JVM dispatches the runtime interface methods to them anyway.
+    // The source of truth is the site's own "Similar titles" block, which the
+    // series page renders as a.ep-sim-card rows (six per page).
+
+    val supportsRelatedAnimes: Boolean get() = true
+
+    suspend fun fetchRelatedAnimeList(anime: SAnime): List<SAnime> {
+        return runCatching {
+            val url = if (anime.url.startsWith("http")) anime.url else "$baseUrl/tvshows/${anime.url}/"
+            client.newCall(GET(url, headers)).execute().use { response ->
+                if (!response.isSuccessful) return@use emptyList()
+                val doc = response.asJsoup()
+                doc.select("a.ep-sim-card").mapNotNull { card ->
+                    val href = card.attr("href").takeIf { it.contains("/tvshows/") }
+                        ?: return@mapNotNull null
+                    val img = card.selectFirst("img")
+                    val title = card.selectFirst(".ep-sim-name")?.text()?.trim()
+                        ?: img?.attr("alt")?.trim()
+                        ?: return@mapNotNull null
+                    SAnime.create().apply {
+                        this.title = title
+                        this.url = href.substringAfter("/tvshows/").trim('/')
+                        thumbnail_url = img?.attr("src")?.takeIf { it.startsWith("http") }
+                    }
+                }.distinctBy { it.url }
+            }
+        }.getOrDefault(emptyList())
+    }
+
     // ============================== Episodes ==============================
 
     override fun episodeListRequest(anime: SAnime): Request =
