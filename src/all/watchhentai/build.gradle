@@ -1,0 +1,9 @@
+ext {
+    extName = 'WatchHentai'
+    extLabel = 'WatchHentai'
+    extClass = '.WatchHentai'
+    extVersionCode = 1
+    isNsfw = true
+}
+
+apply from: "$rootDir/common.gradle"
