@@ -1,0 +1,9 @@
+ext {
+    extName = 'HentaiSh'
+    extLabel = 'HentaiSh'
+    extClass = '.HentaiSh'
+    extVersionCode = 1
+    isNsfw = true
+}
+
+apply from: "$rootDir/common.gradle"

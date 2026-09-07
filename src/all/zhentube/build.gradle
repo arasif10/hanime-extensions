@@ -1,0 +1,9 @@
+ext {
+    extName = 'Zhentube'
+    extLabel = 'Zhentube'
+    extClass = '.Zhentube'
+    extVersionCode = 1
+    isNsfw = true
+}
+
+apply from: "$rootDir/common.gradle"
