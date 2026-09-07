@@ -1,0 +1,9 @@
+ext {
+    extName = 'HahoMoe'
+    extLabel = 'HahoMoe'
+    extClass = '.HahoMoe'
+    extVersionCode = 1
+    isNsfw = true
+}
+
+apply from: "$rootDir/common.gradle"
