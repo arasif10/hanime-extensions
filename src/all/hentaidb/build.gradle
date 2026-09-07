@@ -1,0 +1,9 @@
+ext {
+    extName = 'HentaiDB'
+    extLabel = 'HentaiDB'
+    extClass = '.HentaiDB'
+    extVersionCode = 1
+    isNsfw = true
+}
+
+apply from: "$rootDir/common.gradle"
