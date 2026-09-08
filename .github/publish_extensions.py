@@ -10,7 +10,8 @@ build job it:
   * commits and pushes the change to the "repo" branch.
 
 Source ids are preserved from the existing index; a package that is not already
-listed is skipped with a warning (its id cannot be derived reliably here).
+listed is added automatically by deriving its entry from the extension source
+(build.gradle + <extClass>.kt: id, name, baseUrl, lang, isNsfw).
 
 Usage:
     python publish_extensions.py --apk-dir <dir> --extensions-repo <dir>
@@ -70,11 +71,75 @@ def update_entry(entry, suffix, apk_name, version, code):
     return changed
 
 
+def derive_entry(src_dir: Path, suffix: str, pkg: str, apk_name: str, version: str, code: int):
+    """Build a fresh index entry for a new extension by reading its source.
+
+    Reads extName/extClass/isNsfw from build.gradle and id/name/baseUrl/lang
+    from the main <extClass>.kt. Returns None when anything is missing.
+    """
+    parts = pkg.split(".")
+    if len(parts) < 2:
+        return None
+    lang_dir = parts[-2]  # e.g. 'all' from eu.kanade...all.hahomoe
+    ext_dir = src_dir / lang_dir / parts[-1]
+    gradle_path = ext_dir / "build.gradle"
+    if not gradle_path.exists():
+        return None
+    gradle_text = gradle_path.read_text(encoding="utf-8")
+
+    def gradle_grab(pattern):
+        m = re.search(pattern, gradle_text)
+        return m.group(1) if m else None
+
+    ext_name = gradle_grab(r"extName\s*=\s*'([^']+)'")
+    ext_class = gradle_grab(r"extClass\s*=\s*'(?:\.)?(\w+)'")
+    is_nsfw = re.search(r"isNsfw\s*=\s*true", gradle_text) is not None
+    if not ext_class:
+        return None
+
+    kt_path = ext_dir / "src" / "/".join(parts) / f"{ext_class}.kt"
+    if not kt_path.exists():
+        return None
+    kt_text = kt_path.read_text(encoding="utf-8")
+
+    def kt_grab(pattern):
+        m = re.search(pattern, kt_text)
+        return m.group(1) if m else None
+
+    sid = kt_grab(r"override\s+val\s+id\s*:\s*Long\s*=\s*(-?\d+)L")
+    name = kt_grab(r"override\s+val\s+name\s*=\s*\"([^\"]+)\"")
+    base = kt_grab(r"override\s+val\s+baseUrl\s*=\s*\"([^\"]+)\"")
+    lang = kt_grab(r"override\s+val\s+lang\s*=\s*\"([^\"]+)\"")
+    if sid is None or name is None or base is None or lang is None:
+        return None
+
+    return {
+        "name": ext_name or name,
+        "pkg": pkg,
+        "apk": apk_name,
+        "lang": lang,
+        "code": code,
+        "version": version,
+        "nsfw": 1 if is_nsfw else 0,
+        "hasReadme": 0,
+        "hasChangelog": 0,
+        "sources": [
+            {
+                "id": int(sid),
+                "lang": lang,
+                "name": name,
+                "baseUrl": base,
+            }
+        ],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--apk-dir", required=True, help="directory containing the built APKs (recursively)")
     parser.add_argument("--extensions-repo", required=True, help="checked-out clone of arasif10/anime-extensions")
     parser.add_argument("--icons-dir", default=None, help="optional dir with <suffix>.png icons, synced to icon/<pkg>.png")
+    parser.add_argument("--src-dir", default="src", help="extension source root (to derive entries for new extensions)")
     parser.add_argument("--dry-run", action="store_true", help="update files locally but do not commit or push")
     args = parser.parse_args()
 
@@ -102,8 +167,19 @@ def main():
         entry_pretty = by_pkg_pretty.get(info["pkg"])
         entry_min = by_pkg_min.get(info["pkg"])
         if entry_pretty is None or entry_min is None:
-            print(f"  !! {info['pkg']} is not in the index - skipping (add it manually with its source id)")
-            continue
+            # New extension: derive the entry from its source and add it.
+            derived = derive_entry(Path(args.src_dir), suffix, info["pkg"], apk_name, info["version"], info["code"])
+            if derived is None:
+                print(f"  !! {info['pkg']} is not in the index and could not be derived - skipping")
+                continue
+            entry_pretty = derived
+            entry_min = json.loads(json.dumps(derived))
+            index_pretty.append(entry_pretty)
+            index_min.append(entry_min)
+            by_pkg_pretty[info["pkg"]] = entry_pretty
+            by_pkg_min[info["pkg"]] = entry_min
+            changed = True
+            print(f"  + added new index entry for {info['pkg']} (source id {derived['sources'][0]['id']})")
 
         # Update both index files with the same values.
         c1 = update_entry(entry_pretty, suffix, apk_name, info["version"], info["code"])
