@@ -10,6 +10,7 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
@@ -78,12 +79,26 @@ class Hentaicity : AnimeHttpSource() {
 
         var sort = SORT_RECENT
         var category = CATEGORY_DEFAULT
+        var tag = ""
+        var duration = ""
+        var hdOnly = false
         filterList.forEach { f ->
             when (f) {
                 is SortFilter -> sort = f.sortValue
                 is CategoryFilter -> category = f.category
+                is TagFilter -> tag = f.state.trim()
+                is DurationFilter -> duration = f.durationValue
+                is HdFilter -> hdOnly = f.state
                 else -> {}
             }
+        }
+
+        // min_width/min_duration are supported on the catalog and tag browse
+        // pages (verified against the site's filter form); the text-search
+        // endpoint is left parameter-free.
+        val params = buildList {
+            if (hdOnly) add("min_width" to "1280")
+            if (duration.isNotBlank()) add("min_duration" to duration)
         }
 
         val text = query.trim()
@@ -93,7 +108,17 @@ class Hentaicity : AnimeHttpSource() {
             val path = if (page > 1) "$baseUrl/search/video/$encoded/$page/" else "$baseUrl/search/video/$encoded/"
             return GET(path, headers)
         }
-        return catalogRequest(sort, category, page)
+
+        if (tag.isNotEmpty()) {
+            // Tag browse: /tags/video/{tag} (page 1, NO trailing slash) and
+            // /tags/video/{tag}/{page}/ for deeper pages. Sort/category do not
+            // apply on tag pages.
+            val encoded = URLEncoder.encode(tag, "UTF-8").replace("+", "%20")
+            val base = if (page > 1) "$baseUrl/tags/video/$encoded/$page/" else "$baseUrl/tags/video/$encoded"
+            return GET(addParams(base, params), headers)
+        }
+
+        return catalogRequest(sort, category, page, params)
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage =
@@ -109,10 +134,21 @@ class Hentaicity : AnimeHttpSource() {
     }
 
     /** Page 1 is {cat}-{sort}.html; deeper pages append -{page} before .html. */
-    private fun catalogRequest(sort: String, category: String, page: Int): Request {
+    private fun catalogRequest(
+        sort: String,
+        category: String,
+        page: Int,
+        params: List<Pair<String, String>> = emptyList(),
+    ): Request {
         val name = if (page == 1) "$category-$sort.html" else "$category-$sort-$page.html"
-        return GET("$baseUrl/videos/straight/$name", headers)
+        return GET(addParams("$baseUrl/videos/straight/$name", params), headers)
     }
+
+    private fun addParams(url: String, params: List<Pair<String, String>>): String =
+        url.toHttpUrl().newBuilder()
+            .apply { params.forEach { (name, value) -> addQueryParameter(name, value) } }
+            .build()
+            .toString()
 
     // ============================== Catalogue parsing =====================
 
@@ -314,11 +350,25 @@ class Hentaicity : AnimeHttpSource() {
         val category: String get() = CATEGORIES[state].first
     }
 
+    private class TagFilter : AnimeFilter.Text("Tag (e.g. teacher)")
+
+    /** (min_duration value, label) — values from the site's filter form. */
+    private class DurationFilter :
+        AnimeFilter.Select<String>("Duration", DURATIONS.map { it.second }.toTypedArray(), 0) {
+        val durationValue: String get() = DURATIONS[state].first
+    }
+
+    private class HdFilter : AnimeFilter.CheckBox("HD only")
+
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
         SortFilter(),
         CategoryFilter(),
+        DurationFilter(),
+        HdFilter(),
         AnimeFilter.Separator(),
-        AnimeFilter.Header("Text search overrides the sort/category filters"),
+        TagFilter(),
+        AnimeFilter.Header("Text search overrides all filters; tag browsing"),
+        AnimeFilter.Header("ignores sort/category (site limitation)"),
     )
 
     companion object {
@@ -362,6 +412,14 @@ class Hentaicity : AnimeHttpSource() {
             "teen" to "Teen",
             "toys" to "Toys",
             "voyeur" to "Voyeur",
+        )
+
+        /** (min_duration value, label) — values from the site's filter form. */
+        private val DURATIONS = listOf(
+            "" to "Any duration",
+            "1-480" to "0-8 minutes",
+            "480-1200" to "8-20 minutes",
+            "1200" to "20+ minutes",
         )
 
         private val REGEX_UPLOAD_DATE = Regex("\"uploadDate\"\\s*:\\s*\"([^\"]+)\"")

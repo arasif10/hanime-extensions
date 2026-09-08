@@ -79,21 +79,26 @@ class HahoMoe : AnimeHttpSource() {
         var sort = "rel-d"
         var path: String? = null
         var genre = ""
+        var tag = ""
         filterList.forEach { f ->
             when (f) {
                 is SortFilter -> sort = f.sortValue
                 is PathFilter -> if (path == null) path = f.selectedPath
                 is GenreTokenFilter -> genre = f.state.trim()
+                is TagTokenFilter -> tag = f.state.trim()
                 else -> {}
             }
         }
 
-        // Free text and the genre token both go into q=; the site's search
-        // syntax only supports single-word genre: tokens, multi-word tokens
-        // silently return nothing.
+        // Free text plus the genre/tag tokens all go into q=; the site's search
+        // syntax only supports single-word genre:/tag: tokens — multi-word
+        // tokens (and the unsupported studio:/group:/year: tokens) return
+        // nothing. Dropdown filters swap the browse path; the first selected
+        // one wins because taxonomy paths cannot be combined in one URL.
         val terms = buildList {
             if (query.isNotBlank()) add(query.trim())
             if (genre.isNotBlank()) add("genre:$genre")
+            if (tag.isNotBlank()) add("tag:$tag")
         }
         return browseRequest(page, sort = sort, path = path, q = terms.joinToString(" "))
     }
@@ -336,20 +341,25 @@ class HahoMoe : AnimeHttpSource() {
     private class CensorshipFilter : PathFilter("Censorship", "censorship", CENSORSHIPS)
     private class SourceFilter : PathFilter("Source", "source", SOURCES)
     private class ResolutionFilter : PathFilter("Resolution", "resolution", RESOLUTIONS)
+    private class ContentRatingFilter : PathFilter("Content Rating", "content-rating", CONTENT_RATINGS)
 
-    /** Single-word genre: token (site limitation: multi-word tokens match nothing). */
+    /** Single-word tokens (site limitation: multi-word tokens match nothing). */
     private class GenreTokenFilter : AnimeFilter.Text("Genre (single word, e.g. yuri)")
+    private class TagTokenFilter : AnimeFilter.Text("Tag (single word, e.g. netorare)")
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
         SortFilter(),
         AnimeFilter.Separator(),
-        AnimeFilter.Header("Filters combine (AND) with the search text"),
+        AnimeFilter.Header("Dropdown = browse filter (first selected wins);"),
+        AnimeFilter.Header("Genre/Tag tokens combine with the search text"),
         TypeFilter(),
         StatusFilter(),
         CensorshipFilter(),
         SourceFilter(),
         ResolutionFilter(),
+        ContentRatingFilter(),
         GenreTokenFilter(),
+        TagTokenFilter(),
     )
 
     companion object {
@@ -421,6 +431,17 @@ class HahoMoe : AnimeHttpSource() {
             "576p" to "576p",
             "720p" to "720p",
             "1080p" to "1080p",
+        )
+
+        private val CONTENT_RATINGS = listOf(
+            "" to "Any",
+            "unknown" to "Unknown",
+            "g" to "G - All Ages",
+            "pg" to "PG - Children",
+            "pg13" to "PG-13 - Teens 13+",
+            "rplus" to "R+ - Mild Nudity",
+            "r17plus" to "R - 17+ (violence & profanity)",
+            "rx" to "Rx - Hentai",
         )
     }
 }
