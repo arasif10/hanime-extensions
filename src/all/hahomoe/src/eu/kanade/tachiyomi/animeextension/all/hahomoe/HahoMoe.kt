@@ -183,8 +183,9 @@ class HahoMoe : AnimeHttpSource() {
             Video(url, quality, url, headers = headers)
         }
         if (videos.isEmpty()) throw IOException("HahoMoe: no video sources")
-        // Prefer highest quality first, dedupe by url
-        return videos.distinctBy { it.url }.sortedByDescending { it.quality }
+        // Prefer highest numeric resolution first ("1080p" > "720p"), dedupe by url
+        return videos.distinctBy { it.url }
+            .sortedByDescending { Regex("""(\d+)p""").find(it.quality)?.groupValues?.get(1)?.toIntOrNull() ?: 0 }
     }
 
     // ============================== Helpers ===============================
