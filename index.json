@@ -264,5 +264,24 @@
         "baseUrl": "https://tube.hentaistream.com"
       }
     ]
+  },
+  {
+    "name": "HahoMoe",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.hahomoe",
+    "apk": "aniyomi-all.hahomoe-v14.02-release.apk",
+    "lang": "all",
+    "code": 2,
+    "version": "14.02",
+    "nsfw": 1,
+    "hasReadme": 0,
+    "hasChangelog": 0,
+    "sources": [
+      {
+        "id": 6788476303433097775,
+        "lang": "all",
+        "name": "HahoMoe",
+        "baseUrl": "https://haho.moe"
+      }
+    ]
   }
 ]
