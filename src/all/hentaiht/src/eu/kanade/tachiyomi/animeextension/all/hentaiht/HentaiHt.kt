@@ -106,7 +106,7 @@ class HentaiHt : AnimeHttpSource() {
         val data = json(response.body?.string().orEmpty())
         val titles = data.optJSONArray("titles") ?: JSONArray()
         // The search endpoint returns the full match set; no pagination.
-        return AnimesPage(titles.mapNotNull { titleFrom(it as JSONObject) }, false)
+        return AnimesPage(titles.toObjectList().mapNotNull { titleFrom(it) }, false)
     }
 
     // ============================== Catalog ===============================
@@ -114,7 +114,7 @@ class HentaiHt : AnimeHttpSource() {
     private fun parseCatalog(response: Response): AnimesPage {
         val data = json(response.body?.string().orEmpty())
         val titles = data.optJSONArray("titles") ?: JSONArray()
-        val items = titles.mapNotNull { titleFrom(it as JSONObject) }
+        val items = titles.toObjectList().mapNotNull { titleFrom(it) }
         val page = response.request.url.queryParameter("page")?.toIntOrNull() ?: 1
         val totalPages = data.optInt("totalPages", page)
         return AnimesPage(items, page < totalPages)
@@ -133,6 +133,16 @@ class HentaiHt : AnimeHttpSource() {
 
     // ============================== Details ===============================
 
+    /** Copies a JSONArray of strings into a comma-separated line on the builder. */
+    private fun StringBuilder.appendLine(label: String, arr: JSONArray) {
+        append(label)
+        for (i in 0 until arr.length()) {
+            append(arr.optString(i))
+            if (i < arr.length() - 1) append(", ")
+        }
+        append('\n')
+    }
+
     override fun animeDetailsRequest(anime: SAnime): Request {
         confirmAge()
         val url = anime.url.substringBeforeLast('/')
@@ -144,29 +154,14 @@ class HentaiHt : AnimeHttpSource() {
         val t = data.optJSONObject("title") ?: throw IOException("HentaiHt: no title in details")
         val sb = StringBuilder()
         t.optString("native").takeIf { it.isNotBlank() && it != t.optString("name") }?.let { sb.append(it).append('\n') }
-        t.optJSONArray("synonyms")?.takeIf { it.length() > 0 }?.let { arr ->
-            sb.append("Synonyms: ")
-            for (i in 0 until arr.length()) sb.append(arr.optString(i)).append(", ")
-            sb.setLength(sb.length - 2).append('\n')
-        }
-        t.optJSONArray("studios")?.takeIf { it.length() > 0 }?.let { arr ->
-            val list = (0 until arr.length()).joinToString(", ") { arr.optString(it) }
-            sb.append("Studio: ").append(list).append('\n')
-        }
+        t.optJSONArray("synonyms")?.takeIf { it.length() > 0 }?.let { sb.appendLine("Synonyms: ", it) }
+        t.optJSONArray("studios")?.takeIf { it.length() > 0 }?.let { sb.appendLine("Studio: ", it) }
         t.optString("format").takeIf { it.isNotBlank() }?.let { sb.append("Format: ").append(it).append('\n') }
         t.optString("status").takeIf { it.isNotBlank() }?.let { sb.append("Status: ").append(it).append('\n') }
         t.optInt("year", 0).takeIf { it > 0 }?.let { sb.append("Year: ").append(it).append('\n') }
         t.optString("bestQuality").takeIf { it.isNotBlank() }?.let { sb.append("Quality: ").append(it).append('\n') }
-        t.optJSONArray("languages")?.takeIf { it.length() > 0 }?.let { arr ->
-            sb.append("Audio/Subs: ")
-            for (i in 0 until arr.length()) sb.append(arr.optString(i)).append(", ")
-            sb.setLength(sb.length - 2).append('\n')
-        }
-        t.optJSONArray("tags")?.takeIf { it.length() > 0 }?.let { arr ->
-            sb.append("Tags: ")
-            for (i in 0 until arr.length()) sb.append(arr.optString(i)).append(", ")
-            sb.setLength(sb.length - 2).append('\n')
-        }
+        t.optJSONArray("languages")?.takeIf { it.length() > 0 }?.let { sb.appendLine("Audio/Subs: ", it) }
+        t.optJSONArray("tags")?.takeIf { it.length() > 0 }?.let { sb.appendLine("Tags: ", it) }
         val synopsis = data.optString("synopsis")
         return SAnime.create().apply {
             title = t.optString("name").ifBlank { t.optString("english") }.trim()
@@ -233,6 +228,10 @@ class HentaiHt : AnimeHttpSource() {
         .build()
 
     // ============================== Helpers ===============================
+
+    /** JSONArray -> List<JSONObject> (org.json arrays are not Kotlin iterables). */
+    private fun JSONArray.toObjectList(): List<JSONObject> =
+        (0 until length()).mapNotNull { optJSONObject(it) }
 
     /**
      * Sets a field on SEpisode that exists in AniZen's runtime (lib v16+)
