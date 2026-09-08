@@ -283,5 +283,24 @@
         "baseUrl": "https://haho.moe"
       }
     ]
+  },
+  {
+    "name": "HentaiHt",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.hentaiht",
+    "apk": "aniyomi-all.hentaiht-v14.01-release.apk",
+    "lang": "all",
+    "code": 1,
+    "version": "14.01",
+    "nsfw": 1,
+    "hasReadme": 0,
+    "hasChangelog": 0,
+    "sources": [
+      {
+        "id": 5901363947030062327,
+        "lang": "all",
+        "name": "HentaiHt",
+        "baseUrl": "https://hentai.ht"
+      }
+    ]
   }
 ]
