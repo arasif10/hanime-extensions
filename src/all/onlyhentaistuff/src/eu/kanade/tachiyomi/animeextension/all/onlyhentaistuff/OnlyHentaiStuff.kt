@@ -1,6 +1,7 @@
 /*lint:disable:standard:filename*/
 package eu.kanade.tachiyomi.animeextension.all.onlyhentaistuff
 
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -61,7 +62,7 @@ class OnlyHentaiStuff : AnimeHttpSource() {
         GET(if (page == 1) "$baseUrl/most-popular/" else "$baseUrl/most-popular/$page/", headers)
 
     override fun popularAnimeParse(response: Response): AnimesPage =
-        AnimesPage(catalogCards(response), hasMoreCards(response))
+        parseCatalog(response)
 
     // ============================== Latest ================================
 
@@ -70,35 +71,95 @@ class OnlyHentaiStuff : AnimeHttpSource() {
         GET(if (page == 1) "$baseUrl/latest-updates/" else "$baseUrl/latest-updates/$page/", headers)
 
     override fun latestUpdatesParse(response: Response): AnimesPage =
-        AnimesPage(catalogCards(response), hasMoreCards(response))
+        parseCatalog(response)
 
     // ============================== Search ================================
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        if (query.isBlank()) return popularAnimeRequest(page)
-        val url = buildString {
-            append(baseUrl)
-            append("/search/").append(URLEncoder.encode(query.trim(), "UTF-8"))
-            append("/?mode=async&function=get_block")
-            append("&block_id=list_videos_videos_list_search_result")
-            append("&q=").append(URLEncoder.encode(query.trim(), "UTF-8"))
-            append("&category_ids=&sort_by=")
-            if (page > 1) append("&from_videos+from_albums=").append(page)
+        val sort = (
+            filters.filterIsInstance<SortFilter>().firstOrNull()?.selected()
+                ?: SORTS[0].second
+            )
+        val categoryId = filters.filterIsInstance<CategoryFilter>().firstOrNull()?.selectedId()
+            ?: ""
+        val tag = filters.filterIsInstance<TagFilter>().firstOrNull()?.state
+            ?.trim()?.lowercase()?.replace(Regex("\\s+"), "-")
+            ?: ""
+        val model = filters.filterIsInstance<StudioFilter>().firstOrNull()?.state
+            ?.trim()?.lowercase()?.replace(Regex("\\s+"), "-")
+            ?: ""
+        val q = query.trim()
+
+        // Tag / studio browsing behave like category pages: plain URL + sort query.
+        if (q.isBlank()) {
+            if (tag.isNotEmpty()) return GET(browseUrl("$baseUrl/tags/$tag", sort, page), headers)
+            if (model.isNotEmpty()) return GET(browseUrl("$baseUrl/models/$model", sort, page), headers)
+            if (categoryId.isNotEmpty()) {
+                val slug = CATEGORY_SLUGS[categoryId.toIntOrNull()]
+                if (slug != null) return GET(browseUrl("$baseUrl/categories/$slug", sort, page), headers)
+            }
+            if (sort.isNotEmpty() || categoryId.isNotEmpty()) {
+                return GET(buildSearchUrl("", categoryId, sort, 1), ajaxHeaders)
+            }
+            return popularAnimeRequest(page)
         }
-        return GET(url, ajaxHeaders)
+
+        if (page > 1) {
+            // The ?mode=async search block ignores from_pages; the working
+            // page cursor is `from_videos` (verified: returns page 2 content).
+            return GET(buildSearchUrl(q, categoryId, sort, page), ajaxHeaders)
+        }
+        // Page 1: plain server-rendered results unless sort/category requested.
+        if (sort.isEmpty() && categoryId.isEmpty()) {
+            return GET("$baseUrl/search/${URLEncoder.encode(q, "UTF-8")}/", headers)
+        }
+        return GET(buildSearchUrl(q, categoryId, sort, 1), ajaxHeaders)
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage =
-        AnimesPage(catalogCards(response), hasMoreCards(response))
+        parseCatalog(response, isSearch = true)
 
     // ============================== Filters ===============================
 
-    override fun getFilterList(): AnimeFilterList = AnimeFilterList()
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
+        AnimeFilter.Header("Filters apply to Browse/Search (text query optional)."),
+        SortFilter(),
+        CategoryFilter(),
+        AnimeFilter.Header("Tag / Studio: slug or name (e.g. ahegao, queen-bee)."),
+        TagFilter(),
+        StudioFilter(),
+    )
+
+    private class SortFilter : AnimeFilter.Select<String>(
+        "Sort by",
+        SORTS.map { it.first }.toTypedArray(),
+    ) {
+        fun selected(): String = SORTS[state].second
+    }
+
+    private class CategoryFilter : AnimeFilter.Select<String>(
+        "Category",
+        CATEGORIES.map { it.first }.toTypedArray(),
+    ) {
+        fun selectedId(): String = CATEGORIES[state].second
+    }
+
+    private class TagFilter : AnimeFilter.Text("Tag")
+    private class StudioFilter : AnimeFilter.Text("Studio / Director")
 
     // ============================= Catalogue ==============================
 
-    private fun catalogCards(response: Response): List<SAnime> {
+    private fun parseCatalog(response: Response, isSearch: Boolean = false): AnimesPage {
+        if (!response.isSuccessful) {
+            // Search pages past the result set 404 — treat as end of results.
+            if (isSearch && response.code == 404) return AnimesPage(emptyList(), false)
+            throw IOException("HTTP ${response.code} for ${response.request.url}")
+        }
         val doc = response.asJsoup()
+        return AnimesPage(catalogCards(doc), hasMoreCards(doc))
+    }
+
+    private fun catalogCards(doc: Document): List<SAnime> {
         return doc.select("div.item:has(a[href*=/videos/])").mapNotNull { el ->
             val a = el.selectFirst("a[href*=/videos/]") ?: return@mapNotNull null
             val href = a.absUrl("href").ifBlank { a.attr("href") }
@@ -119,15 +180,11 @@ class OnlyHentaiStuff : AnimeHttpSource() {
         }.distinctBy { it.url }
     }
 
-    private fun hasMoreCards(response: Response): Boolean {
-        val doc = response.asJsoup()
-        // Async block pagination: any further page link (KVS renders
-        // li.page-current for the active page and li.page/a for the rest).
-        if (doc.selectFirst("ul.pagination li.page a") != null) return true
-        // Server-rendered fallbacks
-        if (doc.selectFirst(".pagination a:containsOwn(Next)") != null) return true
-        if (doc.selectFirst("a[rel=next]") != null) return true
-        return false
+    private fun hasMoreCards(doc: Document): Boolean {
+        // KVS renders div.pagination with anchors for further pages; on the
+        // first/last page Back/First are <span>, not <a>.
+        val pagination = doc.selectFirst("div.pagination") ?: return false
+        return pagination.selectFirst("a[href]") != null
     }
 
     // ============================== Details ===============================
@@ -143,18 +200,24 @@ class OnlyHentaiStuff : AnimeHttpSource() {
             author = doc.select("a[href*=/models/]").firstOrNull()?.text()?.trim()
             status = SAnime.UNKNOWN
             description = buildString {
-                doc.selectFirst("meta[name=description]")?.attr("content")?.let { append(it.trim()) }
+                doc.selectFirst("#tab_video_info .info .item em")?.text()?.trim()
+                    ?.takeIf { it.isNotBlank() }?.let { append(it) }
                 val tags = doc.select("a[href*=/tags/]").eachText()
                     .map { it.trim() }.filter { it.isNotBlank() && it != "..." }
                 if (tags.isNotEmpty()) {
                     if (isNotEmpty()) append("\n\n")
                     append("Tags: ").append(tags.distinct().joinToString(", "))
                 }
+                doc.selectFirst("#tab_video_info .info .item")?.text()?.trim()
+                    ?.takeIf { it.isNotBlank() }?.let {
+                        if (isNotEmpty()) append("\n\n")
+                        append(it)
+                    }
             }
             genre = doc.select("a[href*=/categories/], a[href*=/tags/]")
                 .eachText().map { it.trim() }
-                .filter { it.isNotBlank() && it != "..." }
-                .distinct().take(10).joinToString(", ")
+                .filter { it.isNotBlank() && it != "..." && it != "Categories" }
+                .distinct().take(15).joinToString(", ")
         }
     }
 
@@ -264,6 +327,26 @@ class OnlyHentaiStuff : AnimeHttpSource() {
 
     // ============================== Utilities =============================
 
+    private fun browseUrl(base: String, sort: String, page: Int): String = buildString {
+        append(base)
+        if (page > 1) append("/$page")
+        append("/")
+        if (sort.isNotEmpty()) append("?sort_by=").append(sort)
+    }
+
+    private fun buildSearchUrl(query: String, categoryId: String, sort: String, page: Int): String {
+        val q = URLEncoder.encode(query, "UTF-8")
+        return buildString {
+            append(baseUrl)
+            append("/search/?mode=async&function=get_block")
+            append("&block_id=list_videos_videos_list_search_result")
+            append("&q=").append(q)
+            append("&category_ids=").append(categoryId)
+            append("&sort_by=").append(sort)
+            if (page > 1) append("&from_videos=").append(page)
+        }
+    }
+
     private fun Response.asJsoup(): Document =
         Jsoup.parse(body?.string().orEmpty(), request.url.toString())
 
@@ -294,6 +377,100 @@ class OnlyHentaiStuff : AnimeHttpSource() {
         private val PERMUTATION = intArrayOf(
             12, 31, 28, 5, 11, 7, 20, 27, 17, 0, 6, 30, 9, 4, 15, 13,
             8, 3, 16, 25, 10, 19, 14, 29, 24, 18, 23, 22, 2, 21, 26, 1,
+        )
+
+        // (display, sort_by) — verified against the site's own sort lists.
+        private val SORTS = listOf(
+            "Latest" to "",
+            "Most Viewed" to "video_viewed",
+            "Top Rated" to "rating",
+            "Longest" to "duration",
+            "Most Commented" to "most_commented",
+            "Most Favorited" to "most_favourited",
+        )
+
+        // (display, category_ids) — mapped live via h1 "New Videos in X",
+        // ids 1..35. Higher ids return empty on the search endpoint, so
+        // they are deliberately excluded.
+        private val CATEGORIES = listOf(
+            "All" to "",
+            "Oral Sex" to "1",
+            "Anal Sex" to "2",
+            "Rape" to "3",
+            "Big Tits" to "4",
+            "Hardcore" to "5",
+            "BDSM" to "6",
+            "Students" to "7",
+            "Erotic" to "8",
+            "Group Sex" to "9",
+            "Nurse" to "10",
+            "School" to "11",
+            "Maids" to "12",
+            "Incest" to "13",
+            "Fantasy" to "14",
+            "Tentacles" to "15",
+            "Yuri" to "16",
+            "Yaoi" to "17",
+            "Futanari" to "18",
+            "Classic sex" to "19",
+            "Masturbation" to "20",
+            "Lolicon" to "21",
+            "Twins" to "22",
+            "Shotacon" to "23",
+            "Fetishism / toys" to "24",
+            "Uncensored" to "25",
+            "Shounen-Ai" to "26",
+            "Virgin" to "27",
+            "Blowjob" to "28",
+            "Licking" to "29",
+            "Swimsuit" to "30",
+            "Magical girl" to "31",
+            "Kimono" to "32",
+            "Public / outdoor" to "33",
+            "Animal-girls" to "34",
+            "Small tits" to "35",
+            "Sci-Fi" to "41",
+        )
+
+        // category_ids -> /categories/{slug}/ for filter-only browsing.
+        // Verified live: card href slug + thumbnail id in /categories/.
+        private val CATEGORY_SLUGS = mapOf(
+            1 to "oral-sex",
+            2 to "anal-sex",
+            3 to "rape",
+            4 to "big-tits",
+            5 to "hardcore",
+            6 to "bdsm",
+            7 to "students",
+            8 to "erotic",
+            9 to "group-sex",
+            10 to "nurse",
+            11 to "school",
+            12 to "maids",
+            13 to "incest",
+            14 to "fantasy",
+            15 to "tentacles",
+            16 to "yuri",
+            17 to "yaoi",
+            18 to "futanari",
+            19 to "cassic-sex",
+            20 to "masturbation",
+            21 to "lolicon",
+            22 to "twins",
+            23 to "shotacon",
+            24 to "stuff-sex",
+            25 to "no-censor",
+            26 to "shounen-ai",
+            27 to "virgin",
+            28 to "blowjob",
+            29 to "licking",
+            30 to "swimsuit",
+            31 to "magical-girl",
+            32 to "kimono",
+            33 to "public-outdoor",
+            34 to "animal-girls",
+            35 to "small-tits",
+            41 to "sci-fi",
         )
     }
 }

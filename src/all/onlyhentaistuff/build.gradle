@@ -2,7 +2,7 @@ ext {
     extName = 'OnlyHentaiStuff'
     extLabel = 'OnlyHentaiStuff'
     extClass = '.OnlyHentaiStuff'
-    extVersionCode = 1
+    extVersionCode = 2
     isNsfw = true
 }
 
