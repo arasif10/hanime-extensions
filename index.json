@@ -321,5 +321,24 @@
         "baseUrl": "https://www.onlyhentaistuff.com"
       }
     ]
+  },
+  {
+    "name": "HentaiTv",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.hentaitv",
+    "apk": "aniyomi-all.hentaitv-v14.01-release.apk",
+    "lang": "all",
+    "code": 1,
+    "version": "14.01",
+    "nsfw": 1,
+    "hasReadme": 0,
+    "hasChangelog": 0,
+    "sources": [
+      {
+        "id": 1494142395610847787,
+        "lang": "all",
+        "name": "HentaiTv",
+        "baseUrl": "https://hentai.tv"
+      }
+    ]
   }
 ]
