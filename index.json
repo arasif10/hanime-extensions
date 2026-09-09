@@ -302,5 +302,24 @@
         "baseUrl": "https://hentai.ht"
       }
     ]
+  },
+  {
+    "name": "OnlyHentaiStuff",
+    "pkg": "eu.kanade.tachiyomi.animeextension.all.onlyhentaistuff",
+    "apk": "aniyomi-all.onlyhentaistuff-v14.01-release.apk",
+    "lang": "all",
+    "code": 1,
+    "version": "14.01",
+    "nsfw": 1,
+    "hasReadme": 0,
+    "hasChangelog": 0,
+    "sources": [
+      {
+        "id": 8472081291031779782,
+        "lang": "all",
+        "name": "OnlyHentaiStuff",
+        "baseUrl": "https://www.onlyhentaistuff.com"
+      }
+    ]
   }
 ]
