@@ -470,6 +470,61 @@ class OppaiStream : AnimeHttpSource() {
         vp9Level < 50
     }.getOrDefault(true)
 
+    // ============================== Recommendations ==============================
+    // AniZen only fills its "Recommended" section when the source declares
+    // `supportsRelatedAnimes` and implements `fetchRelatedAnimeList`. Those
+    // members exist on AniZen's runtime source API but not on the older lib-14
+    // stub this extension compiles against, so they are declared without
+    // `override` - the JVM still dispatches the runtime interface default
+    // methods to them.
+    //
+    // The related entries come from the site's own catalogue queries: everything
+    // by the same studio first, then titles sharing the entry's tags. The
+    // catalogue ANDs its filters, so every tag needs its own request - a combined
+    // studio + genre query returns nothing at all.
+
+    val supportsRelatedAnimes: Boolean get() = true
+
+    suspend fun fetchRelatedAnimeList(anime: SAnime): List<SAnime> {
+        val wanted = 12
+        val related = LinkedHashMap<String, SAnime>()
+
+        fun collect(request: Request) {
+            if (related.size >= wanted) return
+            runCatching {
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return@use
+                    val (cards, _) = parseCards(response)
+                    cardsToAnimeList(cards)
+                        .filter { it.title != anime.title }
+                        .forEach { entry -> related.getOrPut(entry.title) { entry } }
+                }
+            }
+        }
+
+        anime.author?.takeIf { it.isNotBlank() }
+            ?.let { studio -> collect(catalogueRequest(1, studio = studio, limit = wanted + 6)) }
+        relatedGenres(anime).forEach { genre ->
+            collect(catalogueRequest(1, genres = listOf(genre), limit = wanted + 6))
+        }
+
+        return related.values.take(wanted)
+    }
+
+    /** The entry's own tags that the site exposes as genres, most useful first. */
+    private fun relatedGenres(anime: SAnime): List<String> {
+        val ignored = setOf("3d", "4k", "hd", "filmed", "censored", "uncensored", "unknown")
+        return (anime.genre ?: "").split(",")
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .mapNotNull { tag ->
+                GENRE_LIST.firstOrNull { it.second.equals(tag, ignoreCase = true) }?.first
+            }
+            .filter { it !in ignored }
+            .distinct()
+            .take(2)
+    }
+
     private companion object {
         // (value, display) pairs scraped from the site's genre filter.
         private val GENRE_LIST = arrayOf(
