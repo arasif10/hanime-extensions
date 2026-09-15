@@ -18,10 +18,12 @@ import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import rx.Observable
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Calendar
+import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -75,6 +77,7 @@ class Hanime : AnimeHttpSource() {
         val slug: String,
         val name: String,
         val searchTitles: String,
+        val description: String?,
         val coverUrl: String?,
         val tags: List<String>,
         val brand: String?,
@@ -132,6 +135,17 @@ class Hanime : AnimeHttpSource() {
                         slug = obj.optString("slug"),
                         name = obj.optString("name"),
                         searchTitles = obj.optString("search_titles"),
+                        // The API returns HTML paragraphs; AniZen renders the
+                        // summary as plain text, so flatten it here.
+                        description = obj.optString("description")
+                            .replace(Regex("<[^>]+>"), " ")
+                            .replace("&amp;", "&")
+                            .replace("&quot;", "\"")
+                            .replace("&#39;", "'")
+                            .replace("&nbsp;", " ")
+                            .replace(Regex("\\s+"), " ")
+                            .trim()
+                            .ifEmpty { null },
                         coverUrl = obj.optString("cover_url").ifEmpty {
                             obj.optString("poster_url")
                         }.ifEmpty { null },
@@ -566,28 +580,7 @@ class Hanime : AnimeHttpSource() {
             thumbnail_url = document.selectFirst("meta[property=og:image]")?.attr("content")
                 ?: document.selectFirst("img.hvpi-cover, img.cover")?.attr("src")
 
-            // The real synopsis lives in its own container (div[data-expand-content]);
-            // the site-wide SEO / promo paragraphs ("Our fans' community Discord...",
-            // "What is Hentai?...") appear elsewhere on the page and are skipped.
-            val synopsisParagraphs = document.select("div[data-expand-content] p").mapNotNull { p ->
-                val text = p.text().trim()
-                if (
-                    text.length > 20 &&
-                    !text.contains("Watch ", ignoreCase = true) &&
-                    !text.contains("online", ignoreCase = true) &&
-                    !text.contains("account", ignoreCase = true) &&
-                    !text.contains("download", ignoreCase = true) &&
-                    !text.contains("Share a bug", ignoreCase = true) &&
-                    !text.contains("Session data", ignoreCase = true) &&
-                    !text.contains("refresh the page", ignoreCase = true) &&
-                    !text.contains("playlists", ignoreCase = true) &&
-                    !text.contains("cookie", ignoreCase = true)
-                ) {
-                    text
-                } else {
-                    null
-                }
-            }
+            val synopsisParagraphs = synopsisParagraphs(document)
 
             // Alternative names come straight from the page's "Alternate Names"
             // section (one chip per name, e.g. "Custom Dorei", "Custom Reido",
@@ -692,6 +685,36 @@ class Hanime : AnimeHttpSource() {
         }.getOrDefault(emptyList())
     }
 
+    /**
+     * Maps video slug -> landscape poster for the cards on a details page. The
+     * action buttons that carry data-video-href never hold an image, so the
+     * poster has to be matched by slug: the card anchor gives an exact pairing,
+     * and hanime's CDN additionally names each file after its slug.
+     */
+    private fun postersBySlug(document: Document): Map<String, String> {
+        val posters = HashMap<String, String>()
+
+        document.select("a[href*=/videos/hentai/]").forEach { card ->
+            val slug = card.attr("href").substringBefore("?").substringAfterLast("/")
+            val poster = card.selectFirst("img[src*=/posters/]")?.attr("src")
+                ?.takeIf { it.startsWith("http") }
+            if (slug.isNotBlank() && poster != null) posters.getOrPut(slug) { poster }
+        }
+
+        // Fallback for cards whose image sits outside the anchor:
+        // /images/posters/<slug>-poster_<ts>.webp and <slug>-pv1.jpg
+        document.select("img[src*=/posters/]").forEach { img ->
+            val src = img.attr("src").takeIf { it.startsWith("http") } ?: return@forEach
+            val slug = src.substringAfterLast("/")
+                .substringBeforeLast(".")
+                .replace(Regex("-poster(_\\d+)?$"), "")
+                .replace(Regex("-pv\\d+$"), "")
+            if (slug.isNotBlank()) posters.getOrPut(slug) { src }
+        }
+
+        return posters
+    }
+
     // ============================== Episodes ==============================
     // Episodes are parsed from the video's details page, which lists every
     // episode of the series via data-video-href attributes. This avoids the
@@ -721,8 +744,40 @@ class Hanime : AnimeHttpSource() {
             emptyMap()
         }
 
+        // Episode summaries, shown by AniZen under each row's title - the same
+        // field OppaiStream-style episode rows use. The page in hand is the
+        // opened episode, the catalog covers the rest only when it is already
+        // cached (its dump is multi-megabyte), and any remaining gaps are filled
+        // from the episodes' own pages within a small, bounded budget.
+        val catalogDescriptions = if (catalogFresh()) {
+            runCatching { getCatalog().associate { it.slug to it.description } }
+                .getOrDefault(emptyMap())
+        } else {
+            emptyMap()
+        }
+        val pageSynopsis = synopsisParagraphs(document)
+            .joinToString("\n\n")
+            .ifBlank { null }
+
+        val seriesSlugs = document.select("[data-video-href*=/videos/hentai/]")
+            .mapNotNull { element ->
+                element.attr("data-video-href")
+                    .substringBefore("?")
+                    .substringAfterLast("/")
+                    .takeIf { it.isNotBlank() && baseSlug(it) == base }
+            }
+            .distinct()
+
+        val summaries = HashMap<String, String>()
+        seriesSlugs.forEach { episodeSlug ->
+            val known = catalogDescriptions[episodeSlug] ?: pageSynopsis?.takeIf { episodeSlug == slug }
+            if (known != null) summaries[episodeSlug] = known
+        }
+        fillMissingSummaries(seriesSlugs.filter { it !in summaries }, summaries)
+
         val seen = HashSet<String>()
         val episodes = mutableListOf<SEpisode>()
+        val posters = postersBySlug(document)
 
         // The details page also lists "related videos" from other series, so only
         // keep slugs sharing the same base slug as the opened entry.
@@ -742,13 +797,19 @@ class Hanime : AnimeHttpSource() {
                     url = "/videos/hentai/$epSlug"
                     // The API returns unix seconds; date_upload is epoch millis.
                     date_upload = (releaseDates[epSlug] ?: 0L) * 1000
-                    // Episode cards carry that video's own cover image; action
-                    // buttons (playlist/download/report) don't, so only real
-                    // cards get a preview. AniZen's runtime SEpisode exposes it
-                    // via preview_url (no episode-level thumbnail_url field).
-                    element.selectFirst("img[src]")?.attr("src")
-                        ?.takeIf { it.startsWith("http") }
+                    // The data-video-href elements are the card's action buttons
+                    // (playlist/download/report) - they carry the slug but never an
+                    // image, which is why this used to resolve to nothing. The
+                    // thumbnail is looked up by slug instead. AniZen's runtime
+                    // SEpisode keeps it in preview_url, a field the lib-14 stub
+                    // lacks, hence the reflective setter.
+                    (
+                        posters[epSlug]
+                            ?: element.selectFirst("img[src]")?.attr("src")
+                                ?.takeIf { it.startsWith("http") }
+                        )
                         ?.let { setEpisodeField(this, "preview_url", it) }
+                    summaries[epSlug]?.let { setEpisodeField(this, "summary", it) }
                 },
             )
         }
@@ -765,12 +826,79 @@ class Hanime : AnimeHttpSource() {
                     episode_number = fallbackNumber.toFloat().coerceAtLeast(1f)
                     url = "/videos/hentai/$slug"
                     date_upload = (releaseDates[slug] ?: 0L) * 1000
+                    posters[slug]?.let { setEpisodeField(this, "preview_url", it) }
+                    (summaries[slug] ?: pageSynopsis)
+                        ?.let { setEpisodeField(this, "summary", it) }
                 },
             )
         }
     }
 
     // ============================== Video Streams ==============================
+
+    /**
+     * The video's own synopsis. The real text lives in its own container
+     * (div[data-expand-content]); the site-wide SEO / promo paragraphs ("Our
+     * fans' community Discord...", "What is Hentai?...") sit elsewhere on the
+     * page and the meta description is only the "Watch X latest hentai online
+     * free download" boilerplate, so both are skipped.
+     */
+    private fun synopsisParagraphs(document: Document): List<String> =
+        document.select("div[data-expand-content] p").mapNotNull { p ->
+            val text = p.text().trim()
+            if (
+                text.length > 20 &&
+                !text.contains("Watch ", ignoreCase = true) &&
+                !text.contains("online", ignoreCase = true) &&
+                !text.contains("account", ignoreCase = true) &&
+                !text.contains("download", ignoreCase = true) &&
+                !text.contains("Share a bug", ignoreCase = true) &&
+                !text.contains("Session data", ignoreCase = true) &&
+                !text.contains("refresh the page", ignoreCase = true) &&
+                !text.contains("playlists", ignoreCase = true) &&
+                !text.contains("cookie", ignoreCase = true)
+            ) {
+                text
+            } else {
+                null
+            }
+        }
+
+    /** Episode synopses fetched from video pages, kept for the session. */
+    private val episodeSummaryCache = ConcurrentHashMap<String, String>()
+
+    /**
+     * Fills episode synopses that neither the opened page nor the cached catalog
+     * covers, by reading those videos' own pages. Capped at a handful of pages
+     * and a short wall-clock budget so opening a long series stays fast, and
+     * every result is cached for the rest of the session.
+     */
+    private fun fillMissingSummaries(slugs: List<String>, into: MutableMap<String, String>) {
+        if (slugs.isEmpty()) return
+        slugs.forEach { episodeSummaryCache[it]?.let { cached -> into[it] = cached } }
+
+        val deadline = System.currentTimeMillis() + 4_000
+        var fetched = 0
+        for (slug in slugs) {
+            if (slug in into) continue
+            if (fetched >= 5 || System.currentTimeMillis() > deadline) return
+            fetched++
+            val summary = runCatching {
+                val request = GET("$baseUrl/videos/hentai/$slug", headers)
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        null
+                    } else {
+                        synopsisParagraphs(Jsoup.parse(response.body.string()))
+                            .joinToString("\n\n")
+                            .ifBlank { null }
+                    }
+                }
+            }.getOrNull() ?: continue
+            episodeSummaryCache[slug] = summary
+            into[slug] = summary
+        }
+    }
 
     /**
      * Sets a field on SEpisode that exists in AniZen's runtime (preview_url,
