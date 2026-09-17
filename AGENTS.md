@@ -85,6 +85,24 @@ Consequences — ALL THREE are required whenever you add or change an icon:
    reinstalls an extension unless the versionCode increases, so the new icon
    silently never reaches any device without a bump.
 
+Also: a 512x512 file is not the same thing as 512px of real detail. Several
+sites publish only a tiny logo, so their icon was a small image upscaled to
+512 - which still looks soft, and the Sources tab hides it (it draws the icon
+smaller) while the Extensions tab exposes it. Check the art, not the file size:
+
+- A 16px favicon blown up to 512 is mush. `hstream` (192px source) and
+  `onlyhentaistuff` (a 64px favicon, 8x upscale) were both shipped that way.
+- Better source beats clever processing. Always hunt for a bigger original
+  first (og:image, apple-touch-icon, web manifest icons, the site's inline SVG,
+  a WordPress `-1024x1024` variant). Both sites above cap out small, so the
+  fix there was a quality upscale instead.
+- Good pipeline for flat/cartoon art when no bigger source exists: upscale once
+  with LANCZOS (never sharpen between steps), then **narrow the alpha band**
+  with a smoothstep curve (keeps anti-aliasing, kills the blur halo), then
+  apply `UnsharpMask` to the COLOUR channels only. Sharpening the alpha or
+  hard-thresholding it produces jagged silhouettes.
+- Helpers live in `.work/icons_v2.py` and `.work/logos6_deep.py`.
+
 ## Adding a brand-new extension
 
 1. The source must be committed to `main` FIRST (`src/<lang>/<name>/` + icon +
