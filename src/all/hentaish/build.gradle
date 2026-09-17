@@ -2,7 +2,7 @@ ext {
     extName = 'HentaiSh'
     extLabel = 'HentaiSh'
     extClass = '.HentaiSh'
-    extVersionCode = 2
+    extVersionCode = 3
     isNsfw = true
 }
 
