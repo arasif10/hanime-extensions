@@ -63,6 +63,28 @@ Each repo has two branches:
   and say so in the commit message.
 - Icons live at `icon/<pkg>.png` (e.g. `icon/eu.kanade.tachiyomi.animeextension.en.reanime.png`).
 
+## Icon rules (learned 2026-09-17 — do not regress)
+
+AniZen renders an extension's icon from TWO different sources:
+
+- **Sources tab** -> `icon/<pkg>.png` on the `repo` branch.
+- **Extensions tab / Extension info screen** -> the icon resource INSIDE the
+  installed APK, taken from the density bucket matching the device. The test
+  phone is 450dpi, i.e. it reads the **xxhdpi** bucket.
+
+Consequences — ALL THREE are required whenever you add or change an icon:
+
+1. Source art must be genuinely high-resolution (a real 512px+ logo). An
+   upscaled 16px favicon stays blurry no matter the canvas size.
+2. Put the SAME 512px `ic_launcher.png` in **ALL FIVE** buckets
+   (`mipmap-mdpi/hdpi/xhdpi/xxhdpi/xxxhdpi`). A 512px file in xxxhdpi alone is
+   NOT enough — a 450dpi device reads xxhdpi and upscales whatever small file
+   is there. Reference implementation: `src/all/hanime/res/` (all five buckets
+   are the identical 512px file, crisp on both screens).
+3. **Bump `extVersionCode`** even for icon-only changes. AniZen never
+   reinstalls an extension unless the versionCode increases, so the new icon
+   silently never reaches any device without a bump.
+
 ## Adding a brand-new extension
 
 1. The source must be committed to `main` FIRST (`src/<lang>/<name>/` + icon +
@@ -105,6 +127,10 @@ Each repo has two branches:
   source is missing from `main` — do not rebuild/re-publish ReAnime until its
   source is restored to `src/en/reanime/`, then keep `extVersionCode = 1` so
   the broken debug build is replaced like-for-like.
+- 2026-09-17: icon blur incident fixed across all 17 NSFW extensions: 512px
+  ic_launcher copied into all five mipmap buckets + versionCode bumped, because
+  AniZen's Extensions tab reads the installed APK's xxhdpi icon (450dpi device)
+  while Sources reads the repo `icon/` file. See "Icon rules" above.
 - 2026-09-01: the old private dev monorepo `arasif10/anime-repo` (177 commits,
   all 5 extensions' sources, obsolete monorepo CI) has been archived into
   `anime-extensions` as branches `archive/anime-repo-main` and
