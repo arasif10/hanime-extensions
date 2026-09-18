@@ -9,8 +9,10 @@ import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
+import okhttp3.CookieJar
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
@@ -56,10 +58,28 @@ class HahoMoe : AnimeHttpSource() {
     override fun headersBuilder(): Headers.Builder = Headers.Builder()
         .add("User-Agent", UA)
         .add("Referer", "$baseUrl/")
-        // The site's default list view renders cards WITHOUT any <img>; the
-        // thumbnail view (loop-view=thumb cookie) is the one that carries
-        // <img class=image> posters.
+        // The site's default list view renders cards WITHOUT any <img>; only the
+        // thumbnail view (loop-view=thumb cookie) carries <img class=image>
+        // posters. The cookie is set by the site's own JS (set_cookie), never by
+        // a Set-Cookie header, so it has to be sent explicitly here.
         .add("Cookie", "loop-view=thumb")
+
+    /**
+     * Requests on a cookie-less client.
+     *
+     * okhttp's BridgeInterceptor overwrites any manually set Cookie header with
+     * the client's cookie jar contents, and the app's shared client picks up the
+     * site's XSRF/session cookies on the first response. That silently dropped
+     * our loop-view=thumb cookie, so the server kept returning the list view and
+     * every browse item lost its poster. Nothing on this site needs a session
+     * (verified: catalogue, details, watch, embed and the MP4 itself all serve
+     * fine without any cookie), so the source uses its own jar-free client.
+     */
+    override val client: OkHttpClient by lazy {
+        network.client.newBuilder()
+            .cookieJar(CookieJar.NO_COOKIES)
+            .build()
+    }
 
     // ============================== Popular ===============================
 
