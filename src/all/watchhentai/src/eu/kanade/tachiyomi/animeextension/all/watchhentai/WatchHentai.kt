@@ -16,7 +16,9 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.io.IOException
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
 import java.util.Base64
+import java.util.Locale
 
 /**
  * WatchHentai (https://watchhentai.net)
@@ -52,9 +54,11 @@ class WatchHentai : AnimeHttpSource() {
 
     // ============================== Popular ===============================
 
+    // /videos/ is date-ordered, so it is the *latest* feed. Popular must use the
+    // site's own /trending/ ranking, otherwise both rows render the same entries.
     override fun popularAnimeRequest(page: Int): Request =
         GET(
-            if (page == 1) "$baseUrl/videos/" else "$baseUrl/videos/page/$page/",
+            if (page == 1) "$baseUrl/trending/" else "$baseUrl/trending/page/$page/",
             headers,
         )
 
@@ -81,25 +85,40 @@ class WatchHentai : AnimeHttpSource() {
 
     // ============================== Search ================================
 
+    // Genre browsing is a path (one genre per URL), so the first ticked genre
+    // drives the request and the rest are fetched and merged in the parse step.
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        lastFilters = filters
+        lastPage = page
         if (query.isNotBlank()) {
             return GET("$baseUrl/page/$page/?s=${URLEncoder.encode(query, "UTF-8")}", headers)
         }
-        // Genre browsing is a path (one genre at a time), so it stands in for
-        // the plain catalogue request when a genre is picked.
-        val slug = filters.filterIsInstance<GenreFilter>().firstOrNull()
-            ?.let { filter -> GENRE_SLUGS.getOrNull(filter.state) }
-            .orEmpty()
-        if (slug.isEmpty()) return latestUpdatesRequest(page)
-        return GET(
+        val slugs = selectedGenres(filters)
+        if (slugs.isEmpty()) return latestUpdatesRequest(page)
+        return genreRequest(slugs.first(), page)
+    }
+
+    private fun genreRequest(slug: String, page: Int): Request =
+        GET(
             if (page == 1) "$baseUrl/genre/$slug/" else "$baseUrl/genre/$slug/page/$page/",
             headers,
         )
-    }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
         val doc = response.asJsoup()
-        return AnimesPage(catalogCards(doc), hasMoreCards(doc, pageOf(response)))
+        val merged = LinkedHashMap<String, SAnime>()
+        catalogCards(doc).forEach { merged[it.url] = it }
+        var hasMore = hasMoreCards(doc, pageOf(response))
+
+        // Ticking several genres is an OR: one request per genre, merged by URL.
+        selectedGenres(lastFilters).drop(1).forEach { slug ->
+            client.newCall(genreRequest(slug, lastPage)).execute().use { resp ->
+                val extra = resp.asJsoup()
+                catalogCards(extra).forEach { merged.putIfAbsent(it.url, it) }
+                hasMore = hasMore || hasMoreCards(extra, lastPage)
+            }
+        }
+        return AnimesPage(merged.values.toList(), hasMore)
     }
 
     // ============================ Catalogue ===============================
@@ -130,6 +149,15 @@ class WatchHentai : AnimeHttpSource() {
         }.distinctBy { it.url }
     }
 
+    /** "2026-08-11T04:12:35+00:00" (JSON-LD) to a timestamp, or 0 when absent. */
+    private fun parseDate(raw: String?): Long {
+        if (raw.isNullOrBlank()) return 0L
+        val pattern = if (raw.length > 10) "yyyy-MM-dd'T'HH:mm:ss" else "yyyy-MM-dd"
+        return runCatching {
+            SimpleDateFormat(pattern, Locale.US).parse(raw.take(pattern.length + 10))!!.time
+        }.getOrDefault(0L)
+    }
+
     /** The page number the app asked for, taken from the request path. */
     private fun pageOf(response: Response): Int =
         Regex("""/page/(\d+)/""").find(response.request.url.encodedPath)
@@ -149,14 +177,37 @@ class WatchHentai : AnimeHttpSource() {
     // ============================== Filters ===============================
 
     // WatchHentai's catalogue rows carry no per-title genres, so an exclude
-    // option could not be honoured without fetching every row's details. This is
-    // a single-choice include filter on the site's own /genre/<slug>/ listings.
+    // option could not be honoured without fetching every row's details. Ticking
+    // several genres unions their /genre/<slug>/ listings instead.
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
         AnimeFilter.Header("Applies to browsing - leave the search box empty"),
         GenreFilter(),
     )
 
-    private class GenreFilter : AnimeFilter.Select<String>("Genre", GENRE_NAMES, 0)
+    private var lastFilters: AnimeFilterList? = null
+    private var lastPage: Int = 1
+
+    private class GenreFilter : AnimeFilter.Group<AnimeFilter.CheckBox>(
+        "Genres",
+        GENRE_NAMES.drop(1).map { GenreCheckBox(it) },
+    )
+
+    private class GenreCheckBox(name: String) : AnimeFilter.CheckBox(name, false)
+
+    private fun flatFilters(filters: AnimeFilterList?): List<AnimeFilter<*>> = filters.orEmpty().flatMap { filter ->
+        if (filter is AnimeFilter.Group<*>) {
+            filter.state.filterIsInstance<AnimeFilter<*>>()
+        } else {
+            listOf(filter)
+        }
+    }
+
+    private fun selectedGenres(filters: AnimeFilterList?): List<String> =
+        flatFilters(filters).filterIsInstance<AnimeFilter.CheckBox>()
+            .filter { it.state }
+            .mapNotNull { box -> GENRE_NAMES.indexOf(box.name).takeIf { it > 0 } }
+            .map { GENRE_SLUGS[it] }
+            .distinct()
 
     // ============================== Details ===============================
 
@@ -189,12 +240,26 @@ class WatchHentai : AnimeHttpSource() {
         GET("$baseUrl/${anime.url}", headers)
 
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val doc = response.asJsoup()
-        // Both series pages and episode posts carry the series episode list in
-        // <ul class="episodios"> (single-episode posts just list one entry).
-        val items = doc.select("ul.episodios li a[href*=/videos/]")
+        // Read the body once: okhttp bodies are one-shot, and the JSON-LD block
+        // with the publish date is not part of the episode anchors.
+        val html = response.body?.string().orEmpty()
+        val doc = Jsoup.parse(html, response.request.url.toString())
+        val published = DATE_PUBLISHED.find(html)?.groupValues?.get(1)?.let(::parseDate) ?: 0L
+        // This site models every entry as a single-episode post: a series page
+        // links exactly one /videos/<slug>/ URL and has no episode-list markup at
+        // all. Falling back to that link is what keeps episodes from vanishing
+        // (the old code required ul.episodios and threw when it was absent).
+        val listMarkup = doc.select("ul.episodios li a[href*=/videos/]")
+        val items = if (listMarkup.isNotEmpty()) {
+            listMarkup
+        } else {
+            // Jsoup's Elements.filter takes a NodeFilter, so go through a plain
+            // Kotlin list to filter on the href instead.
+            doc.select("a[href*=/videos/]").toList()
+                .filter { EPISODE_PATH.containsMatchIn(it.attr("href")) }
+        }
         if (items.isEmpty()) {
-            throw IOException("WatchHentai: no episode list found")
+            throw IOException("WatchHentai: no episode link found")
         }
         return items.mapNotNull { a ->
             val href = a.absUrl("href").ifBlank { a.attr("href") }
@@ -204,6 +269,7 @@ class WatchHentai : AnimeHttpSource() {
             SEpisode.create().apply {
                 url = href.removePrefix("$baseUrl/").trim('/')
                 name = title.ifBlank { "Episode 1" }
+                date_upload = published
                 episode_number = Regex("""(?:episode|ep)[-\s]?(\d+)""", RegexOption.IGNORE_CASE)
                     .find(title + " " + href)?.groupValues?.get(1)?.toFloatOrNull() ?: 1f
                 a.parent()?.selectFirst("img")?.let { img ->
@@ -295,6 +361,12 @@ class WatchHentai : AnimeHttpSource() {
                 ",Train Molestation|train-molestation,Tsundere|tsundere,Uncensored|uncensored" +
                 ",Upcoming|upcoming,Urination|urination,Vampire|vampire,Vanilla|vanilla,Virgins|virgins" +
                 ",Widow|widow,X-Ray|x-ray,Yaoi|yaoi,Yuri|yuri"
+
+        // A real episode path (/videos/<slug>/), not the bare /videos/ nav link.
+        private val EPISODE_PATH = Regex("""/videos/[^/]+/""")
+
+        private val DATE_PUBLISHED =
+            Regex(""""datePublished"\s*:\s*"([^"]+)"""")
 
         private val GENRE_SLUGS = arrayOf("") +
             GENRE_PAIRS.split(",").map { it.substringAfter('|') }.toTypedArray()
