@@ -17,6 +17,8 @@ import org.json.JSONObject
 import rx.Observable
 import java.io.IOException
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 /**
  * Hentaverse (https://hentaverse.com)
@@ -163,7 +165,7 @@ class Hentaverse : AnimeHttpSource() {
         AnimeFilter.CheckBox(name, state)
 
     private class CategoryGroup : AnimeFilter.Group<AnimeFilter.CheckBox>(
-        "Categories - tick any number (matches any)",
+        "Categories",
         CATEGORY_NAMES.map { CategoryCheckBox(it) },
     )
 
@@ -237,6 +239,8 @@ class Hentaverse : AnimeHttpSource() {
                 this.url = videoPath
                 name = ep.optString("title").ifBlank { "Episode $number" }
                 episode_number = number.toFloat()
+                // Each video carries its own createdAt (ISO-8601 UTC).
+                date_upload = parseDate(ep.optString("createdAt"))
                 ep.optString("thumbnail").takeIf { it.isNotBlank() }?.let {
                     setEpisodeField(this, "preview_url", cdn(it))
                 }
@@ -269,6 +273,17 @@ class Hentaverse : AnimeHttpSource() {
     // ============================== Helpers ===============================
 
     private fun cdn(path: String): String = "$CDN/${path.trimStart('/')}"
+
+    /** "2025-06-12T06:04:03.877Z" -> epoch millis; day precision is enough. */
+    private fun parseDate(text: String?): Long {
+        val day = Regex("""(\d{4}-\d{2}-\d{2})""").find(text.orEmpty())?.groupValues?.get(1)
+            ?: return 0L
+        return try {
+            SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(day)?.time ?: 0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
 
     private fun setEpisodeField(episode: SEpisode, fieldName: String, value: String) {
         try {

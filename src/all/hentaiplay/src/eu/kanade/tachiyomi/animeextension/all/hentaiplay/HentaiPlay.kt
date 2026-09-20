@@ -17,6 +17,8 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 /**
  * HentaiPlay (https://hentaiplay.net)
@@ -165,8 +167,8 @@ class HentaiPlay : AnimeHttpSource() {
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
         // Groups render as collapsible sections in AniZen; a bare list of
         // TriState rows would stay expanded and bury the other filters.
-        FilterGroup("Genres (include/exclude)", *genreRows(GENRE_NAMES, GENRE_SLUGS)),
-        FilterGroup("Studios (include/exclude)", *genreRows(STUDIO_NAMES, STUDIO_SLUGS)),
+        FilterGroup("Genres", *genreRows(GENRE_NAMES, GENRE_SLUGS)),
+        FilterGroup("Studios", *genreRows(STUDIO_NAMES, STUDIO_SLUGS)),
         AnimeFilter.Header("Released year"),
         YearFilter(),
         AnimeFilter.Header("Sorting"),
@@ -241,13 +243,19 @@ class HentaiPlay : AnimeHttpSource() {
         GET("$baseUrl/${anime.url}/", headers)
 
     override fun episodeListParse(response: Response): List<SEpisode> {
-        val doc = response.asJsoup()
+        val html = response.body?.string().orEmpty()
+        val doc = Jsoup.parse(html, response.request.url.toString())
         val title = doc.selectFirst("h1")?.text()?.trim().orEmpty()
         val img = doc.selectFirst("meta[property=og:image]")?.attr("content")
         val ep = SEpisode.create().apply {
             url = response.request.url.toString().substringAfter("$baseUrl/").trim('/')
             name = title
             episode_number = 1f
+            // JSON-LD carries the post's own publish date (the visible <time>
+            // tags belong to the sidebar's recent posts).
+            date_upload = parseDate(
+                Regex(""""datePublished"\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1),
+            )
             img?.takeIf { it.startsWith("http") }?.let { setEpisodeField(this, "preview_url", it) }
         }
         return listOf(ep)
@@ -273,6 +281,17 @@ class HentaiPlay : AnimeHttpSource() {
     // ============================== Helpers ===============================
 
     private fun Response.asJsoup(): Document = Jsoup.parse(body?.string().orEmpty(), request.url.toString())
+
+    /** "2026-09-17T01:34:24+00:00" -> epoch millis; day precision is enough. */
+    private fun parseDate(text: String?): Long {
+        val day = Regex("""(\d{4}-\d{2}-\d{2})""").find(text.orEmpty())?.groupValues?.get(1)
+            ?: return 0L
+        return try {
+            SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(day)?.time ?: 0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
 
     private fun setEpisodeField(episode: SEpisode, fieldName: String, value: String) {
         try {

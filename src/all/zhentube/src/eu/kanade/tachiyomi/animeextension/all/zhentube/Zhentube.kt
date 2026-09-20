@@ -17,6 +17,8 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.io.IOException
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 /**
  * Zhentube (https://zhentube.com)
@@ -163,9 +165,9 @@ class Zhentube : AnimeHttpSource() {
     // ============================== Filters ===============================
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        FilterGroup("Genres (include/exclude)", *facetRows(GENRE_NAMES, GENRE_SLUGS)),
-        FilterGroup("Studios (include/exclude)", *facetRows(STUDIO_NAMES, STUDIO_SLUGS)),
-        FilterGroup("Actors (include/exclude)", *facetRows(ACTOR_NAMES, ACTOR_SLUGS)),
+        FilterGroup("Genres", *facetRows(GENRE_NAMES, GENRE_SLUGS)),
+        FilterGroup("Studios", *facetRows(STUDIO_NAMES, STUDIO_SLUGS)),
+        FilterGroup("Actors", *facetRows(ACTOR_NAMES, ACTOR_SLUGS)),
         AnimeFilter.Header("Sorting"),
         SortFilter(),
     )
@@ -253,6 +255,10 @@ class Zhentube : AnimeHttpSource() {
                 url = javbestId
                 name = title.ifBlank { slug }
                 episode_number = number
+                // <meta itemprop="uploadDate" content="2025-09-15T06:52:55-07:00">
+                date_upload = parseDate(
+                    doc.selectFirst("meta[itemprop=uploadDate]")?.attr("content"),
+                )
                 doc.selectFirst("meta[property=og:image]")?.attr("content")?.let {
                     setEpisodeField(this, "preview_url", it)
                 }
@@ -297,6 +303,17 @@ class Zhentube : AnimeHttpSource() {
     // ============================== Helpers ===============================
 
     private fun Response.asJsoup() = Jsoup.parse(body?.string().orEmpty(), request.url.toString())
+
+    /** "2025-09-15T06:52:55-07:00" -> epoch millis; day precision is enough. */
+    private fun parseDate(text: String?): Long {
+        val day = Regex("""(\d{4}-\d{2}-\d{2})""").find(text.orEmpty())?.groupValues?.get(1)
+            ?: return 0L
+        return try {
+            SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(day)?.time ?: 0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
 
     private fun setEpisodeField(episode: SEpisode, fieldName: String, value: String) {
         try {

@@ -14,6 +14,8 @@ import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
 import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Locale
 
 /**
  * HentaiOcean (https://hentaiocean.com)
@@ -146,7 +148,7 @@ class HentaiOcean : AnimeHttpSource() {
         AnimeFilter.CheckBox(name, state)
 
     private class GenreGroup : AnimeFilter.Group<AnimeFilter.CheckBox>(
-        "Genres - tick any number (matches any)",
+        "Genres",
         GENRE_NAMES.map { GenreCheckBox(it) },
     )
 
@@ -210,6 +212,8 @@ class HentaiOcean : AnimeHttpSource() {
                 url = "watch/$slug"
                 name = epName
                 episode_number = number
+                // The watch page renders "Release date: 2026-09-11".
+                date_upload = parseDate(RELEASE_DATE_REGEX.find(body)?.groupValues?.get(1))
                 setEpisodeField(this, "preview_url", "$baseUrl/thumbnail/$slug.webp")
             },
         )
@@ -260,6 +264,17 @@ class HentaiOcean : AnimeHttpSource() {
             .replace("\\r\\n", "\n")
             .replace("\\\\", "\\")
 
+    /** "2026-09-11" -> epoch millis. */
+    private fun parseDate(text: String?): Long {
+        val day = Regex("""(\d{4}-\d{2}-\d{2})""").find(text.orEmpty())?.groupValues?.get(1)
+            ?: return 0L
+        return try {
+            SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(day)?.time ?: 0L
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
     private fun setEpisodeField(episode: SEpisode, fieldName: String, value: String) {
         try {
             val setter = episode.javaClass.getMethod(
@@ -276,6 +291,7 @@ class HentaiOcean : AnimeHttpSource() {
         private const val PAGE_SIZE = 24
 
         private val WATCH_LINK_REGEX = Regex("""href="(https://hentaiocean\.com/watch/[^"]+)"""")
+        private val RELEASE_DATE_REGEX = Regex("""Release date:</b>\s*(\d{4}-\d{2}-\d{2})""")
         private val RSS_ITEM_REGEX = Regex("<guid>([^<]+)</guid>")
         private val JSON_STRING_REGEX = Regex(""""(urlname|videoname)":"((?:[^"\\]|\\.)*)"""")
     }
