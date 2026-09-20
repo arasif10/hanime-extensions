@@ -1,6 +1,7 @@
 /*lint:disable:standard:filename*/
 package eu.kanade.tachiyomi.animeextension.all.hentaverse
 
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -63,16 +64,49 @@ class Hentaverse : AnimeHttpSource() {
 
     // ============================== Search ================================
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request =
+    // Multi-select merges one request per checked category, so the parse step
+    // needs to know which ones were checked and which page it is on.
+    private var lastFilters: AnimeFilterList? = null
+    private var lastPage: Int = 1
+
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        lastFilters = filters
+        lastPage = page
         if (query.isNotBlank()) {
-            apiRequest("/search?q=${URLEncoder.encode(query, "UTF-8")}")
-        } else {
-            apiRequest("/series?page=$page")
+            return apiRequest("/search?q=${URLEncoder.encode(query, "UTF-8")}")
         }
+        val slugs = selectedCategories(filters)
+        if (slugs.isEmpty()) {
+            val sort = sortSlug(filters)
+            val suffix = if (sort.isEmpty()) "" else "&sort=$sort"
+            return apiRequest("/series?page=$page$suffix")
+        }
+        // Only the first category is fetched here; the rest are merged in
+        // searchAnimeParse, because a single request can carry one response.
+        return apiRequest("/categories/${slugs.first()}/series?page=$page")
+    }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
-        val url = response.request.url.toString()
-        if (!url.contains("/search?")) return seriesPage(response)
+        if (response.request.url.toString().contains("/search?")) return searchResultsPage(response)
+        val first = seriesPage(response)
+        val rest = selectedCategories(lastFilters).drop(1)
+        if (rest.isEmpty()) return first
+        // Multi-select is OR: fetch each remaining category and merge by slug.
+        val merged = LinkedHashMap<String, SAnime>()
+        first.animes.forEach { merged[it.url] = it }
+        var hasMore = first.hasNextPage
+        rest.forEach { slug ->
+            client.newCall(apiRequest("/categories/$slug/series?page=$lastPage")).execute().use { resp ->
+                val page = seriesPage(resp)
+                page.animes.forEach { merged.putIfAbsent(it.url, it) }
+                hasMore = hasMore || page.hasNextPage
+            }
+        }
+        return AnimesPage(merged.values.toList(), hasMore)
+    }
+
+    /** Search answers with individual videos, so group them by series slug. */
+    private fun searchResultsPage(response: Response): AnimesPage {
         val body = response.body?.string().orEmpty()
         if (body.isBlank()) return AnimesPage(emptyList(), false)
         val json = JSONObject(body).optJSONObject("data")?.optJSONObject("results")
@@ -97,7 +131,8 @@ class Hentaverse : AnimeHttpSource() {
     private fun seriesPage(response: Response): AnimesPage {
         val body = response.body?.string().orEmpty()
         if (body.isBlank()) return AnimesPage(emptyList(), false)
-        val items = JSONObject(body).optJSONObject("data")?.optJSONArray("items") ?: JSONArray()
+        val root = JSONObject(body)
+        val items = root.optJSONObject("data")?.optJSONArray("items") ?: JSONArray()
         val animes = (0 until items.length()).mapNotNull { i ->
             val obj = items.optJSONObject(i) ?: return@mapNotNull null
             val slug = obj.optString("slug").ifBlank { return@mapNotNull null }
@@ -109,7 +144,48 @@ class Hentaverse : AnimeHttpSource() {
                 initialized = true
             }
         }
-        return AnimesPage(animes, animes.isNotEmpty())
+        // /categories/{slug}/series reports real pagination; /series?page=N does not.
+        val hasMore = root.optJSONObject("pagination")?.optBoolean("hasMore") ?: animes.isNotEmpty()
+        return AnimesPage(animes, hasMore)
+    }
+
+    // ============================== Filters ===============================
+
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
+        CategoryGroup(),
+        AnimeFilter.Header("Sorting"),
+        SortFilter(),
+    )
+
+    // The lib's AnimeFilter.CheckBox is abstract, so a concrete subclass is
+    // required (same pattern as the other extensions).
+    private class CategoryCheckBox(name: String, state: Boolean = false) :
+        AnimeFilter.CheckBox(name, state)
+
+    private class CategoryGroup : AnimeFilter.Group<AnimeFilter.CheckBox>(
+        "Categories - tick any number (matches any)",
+        CATEGORY_NAMES.map { CategoryCheckBox(it) },
+    )
+
+    private class SortFilter : AnimeFilter.Select<String>("Sort by", SORT_NAMES, 0)
+
+    private fun flatFilters(filters: AnimeFilterList?): List<AnimeFilter<*>> = filters.orEmpty().flatMap { filter ->
+        if (filter is AnimeFilter.Group<*>) {
+            filter.state.filterIsInstance<AnimeFilter<*>>()
+        } else {
+            listOf(filter)
+        }
+    }
+
+    private fun selectedCategories(filters: AnimeFilterList?): List<String> =
+        flatFilters(filters).filterIsInstance<AnimeFilter.CheckBox>()
+            .filter { it.state }
+            .mapNotNull { box -> CATEGORY_NAMES.indexOf(box.name).takeIf { it >= 0 } }
+            .map { CATEGORY_SLUGS[it] }
+
+    private fun sortSlug(filters: AnimeFilterList): String {
+        val index = flatFilters(filters).filterIsInstance<SortFilter>().firstOrNull()?.state ?: 0
+        return SORT_SLUGS.getOrNull(index) ?: ""
     }
 
     // ============================== Details ===============================

@@ -1,6 +1,7 @@
 /*lint:disable:standard:filename*/
 package eu.kanade.tachiyomi.animeextension.all.hentaiocean
 
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -52,16 +53,16 @@ class HentaiOcean : AnimeHttpSource() {
     override fun popularAnimeRequest(page: Int): Request =
         GET("$baseUrl/", headers)
 
-    override fun popularAnimeParse(response: Response): AnimesPage {
-        val body = response.body?.string().orEmpty()
-        val animes = Regex("""href="(https://hentaiocean\.com/watch/[^"]+)"""")
-            .findAll(body)
-            .map { it.groupValues[1] }
-            .distinct()
-            .map { slugToAnime(it.substringAfter("/watch/")) }
-            .toList()
-        return AnimesPage(animes, false)
-    }
+    override fun popularAnimeParse(response: Response): AnimesPage =
+        AnimesPage(watchCards(response.body?.string().orEmpty()), false)
+
+    // The homepage, genre pages and every /genre browsed view render the same
+    // /watch/ links, so one parser serves all of them.
+    private fun watchCards(body: String): List<SAnime> = WATCH_LINK_REGEX.findAll(body)
+        .map { it.groupValues[1] }
+        .distinct()
+        .map { slugToAnime(it.substringAfter("/watch/")) }
+        .toList()
 
     // ============================== Latest ================================
 
@@ -79,27 +80,87 @@ class HentaiOcean : AnimeHttpSource() {
 
     // ============================== Search ================================
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request =
+    // Multi-select merges one request per checked genre, so the parse step needs
+    // to know which ones were checked.
+    private var lastFilters: AnimeFilterList? = null
+
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        lastFilters = filters
         if (query.isNotBlank()) {
-            GET("$baseUrl/api?action=search&query=${URLEncoder.encode(query, "UTF-8")}", headers)
-        } else {
-            latestUpdatesRequest(page)
+            return GET("$baseUrl/api?action=search&query=${URLEncoder.encode(query, "UTF-8")}", headers)
         }
+        val slugs = selectedGenres(filters)
+        if (slugs.isEmpty()) return latestUpdatesRequest(page)
+        // Only the first genre is fetched here; the rest are merged below.
+        return GET("$baseUrl/genre/${slugs.first()}", headers)
+    }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
         val body = response.body?.string().orEmpty().trim()
-        if (!body.startsWith("[")) return AnimesPage(emptyList(), false)
-        val animes = JSON_STRING_REGEX.findAll(body).mapNotNull { m ->
-            val urlname = m.groupValues[1]
-            val videoname = m.groupValues[2].unescape()
-            SAnime.create().apply {
-                title = videoname
-                url = "watch/$urlname"
-                thumbnail_url = "$baseUrl/thumbnail/$urlname.webp"
+        // Genre pages are server-rendered HTML carrying /watch/ links; the search
+        // API answers with a JSON array of the same items.
+        val animes = if (body.startsWith("[")) searchCards(body) else watchCards(body)
+        val rest = selectedGenres(lastFilters).drop(1)
+        if (rest.isEmpty()) return AnimesPage(animes, false)
+        // Multi-select is OR: fetch each remaining genre page and merge by URL.
+        val merged = LinkedHashMap<String, SAnime>()
+        animes.forEach { merged[it.url] = it }
+        rest.forEach { slug ->
+            client.newCall(GET("$baseUrl/genre/$slug", headers)).execute().use { resp ->
+                watchCards(resp.body?.string().orEmpty()).forEach { merged.putIfAbsent(it.url, it) }
             }
-        }.toList()
-        return AnimesPage(animes, false)
+        }
+        return AnimesPage(merged.values.toList(), false)
     }
+
+    /** The search API returns [{"urlname":..,"videoname":..}, ...] JSON. */
+    private fun searchCards(body: String): List<SAnime> {
+        val animes = mutableListOf<SAnime>()
+        var pendingSlug: String? = null
+        for (match in JSON_STRING_REGEX.findAll(body)) {
+            val value = match.groupValues[2].unescape()
+            if (match.groupValues[1] == "urlname") {
+                pendingSlug = value
+            } else {
+                val slug = pendingSlug ?: continue
+                animes += SAnime.create().apply {
+                    title = value
+                    url = "watch/$slug"
+                    thumbnail_url = "$baseUrl/thumbnail/$slug.webp"
+                }
+                pendingSlug = null
+            }
+        }
+        return animes
+    }
+
+    // ============================== Filters ===============================
+
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
+        GenreGroup(),
+    )
+
+    // The lib's AnimeFilter.CheckBox is abstract, so a concrete subclass is
+    // required (same pattern as the other extensions).
+    private class GenreCheckBox(name: String, state: Boolean = false) :
+        AnimeFilter.CheckBox(name, state)
+
+    private class GenreGroup : AnimeFilter.Group<AnimeFilter.CheckBox>(
+        "Genres - tick any number (matches any)",
+        GENRE_NAMES.map { GenreCheckBox(it) },
+    )
+
+    private fun selectedGenres(filters: AnimeFilterList?): List<String> =
+        filters.orEmpty().flatMap { filter ->
+            if (filter is AnimeFilter.Group<*>) {
+                filter.state.filterIsInstance<AnimeFilter<*>>()
+            } else {
+                listOf(filter)
+            }
+        }.filterIsInstance<AnimeFilter.CheckBox>()
+            .filter { it.state }
+            .mapNotNull { box -> GENRE_NAMES.indexOf(box.name).takeIf { it >= 0 } }
+            .map { GENRE_SLUGS[it] }
 
     // ============================== Details ===============================
 
@@ -214,6 +275,7 @@ class HentaiOcean : AnimeHttpSource() {
         private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
         private const val PAGE_SIZE = 24
 
+        private val WATCH_LINK_REGEX = Regex("""href="(https://hentaiocean\.com/watch/[^"]+)"""")
         private val RSS_ITEM_REGEX = Regex("<guid>([^<]+)</guid>")
         private val JSON_STRING_REGEX = Regex(""""(urlname|videoname)":"((?:[^"\\]|\\.)*)"""")
     }

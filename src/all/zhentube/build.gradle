@@ -2,7 +2,7 @@ ext {
     extName = 'Zhentube'
     extLabel = 'Zhentube'
     extClass = '.Zhentube'
-    extVersionCode = 5
+    extVersionCode = 6
     isNsfw = true
 }
 

@@ -1,6 +1,7 @@
 /*lint:disable:standard:filename*/
 package eu.kanade.tachiyomi.animeextension.all.hentaiplay
 
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -63,21 +64,47 @@ class HentaiPlay : AnimeHttpSource() {
 
     // ============================== Search ================================
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request =
+    // Exclusion is enforced while parsing the rows, and AniZen only hands the
+    // filter list to the *request* builder, so keep the last one.
+    private var lastFilters: AnimeFilterList? = null
+
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        lastFilters = filters
         if (query.isNotBlank()) {
-            GET(
+            return GET(
                 "$baseUrl/".toHttpUrl().newBuilder()
                     .addQueryParameter("s", query)
                     .addQueryParameter("paged", page.toString())
                     .build(),
                 headers,
             )
-        } else {
-            GET("$baseUrl/?orderby=views&paged=$page", headers)
         }
+        // Included genres and the year are ANDed by the site's "+" term
+        // separator, which keeps result pages dense; excludes are dropped after
+        // parsing (they cannot be expressed in a WordPress taxonomy URL).
+        val terms = includedTerms(filters)
+        val path = when {
+            terms.isEmpty() && page == 1 -> "$baseUrl/"
+            terms.isEmpty() -> "$baseUrl/page/$page/"
+            page == 1 -> "$baseUrl/genre/${terms.joinToString("+")}/"
+            else -> "$baseUrl/genre/${terms.joinToString("+")}/page/$page/"
+        }
+        return GET("$path?orderby=${sortSlug(filters)}", headers)
+    }
 
-    override fun searchAnimeParse(response: Response): AnimesPage =
-        paginatedAnimesPage(response)
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val parsed = paginatedAnimesPage(response)
+        val included = includedSlugs(lastFilters)
+        val excluded = excludedSlugs(lastFilters)
+        if (included.isEmpty() && excluded.isEmpty()) return parsed
+        return AnimesPage(
+            parsed.animes.filter { anime ->
+                val tags = tagsOf(anime)
+                included.all { it in tags } && excluded.none { it in tags }
+            },
+            parsed.hasNextPage,
+        )
+    }
 
     // ============================== Catalogue parsing =====================
 
@@ -113,7 +140,82 @@ class HentaiPlay : AnimeHttpSource() {
             this.title = title
             this.url = href.substringAfter("$baseUrl/").trim('/')
             thumbnail_url = img?.attr("src")?.takeIf { it.startsWith("http") }
+            // The post wrapper carries the genre taxonomy as tag-<slug>
+            // classes; keep them on the row so include/exclude can be enforced.
+            genre = cardTags(el).joinToString(", ").ifBlank { null }
         }
+    }
+
+    /** The wrapper element above a card holds its `tag-<slug>` classes. */
+    private fun cardTags(el: Element): List<String> {
+        val wrapper = el.parents().firstOrNull { parent ->
+            parent.classNames().any { it.startsWith("tag-") }
+        } ?: return emptyList()
+        // tag-1492 style numeric classes are tag IDs, not slugs.
+        return wrapper.classNames()
+            .filter { it.startsWith("tag-") && it.removePrefix("tag-").any(Char::isLetter) }
+            .map { it.removePrefix("tag-") }
+    }
+
+    private fun tagsOf(anime: SAnime): List<String> =
+        anime.genre?.split(", ")?.filter { it.isNotBlank() }.orEmpty()
+
+    // ============================== Filters ===============================
+
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
+        // Groups render as collapsible sections in AniZen; a bare list of
+        // TriState rows would stay expanded and bury the other filters.
+        FilterGroup("Genres (include/exclude)", *genreRows(GENRE_NAMES, GENRE_SLUGS)),
+        FilterGroup("Studios (include/exclude)", *genreRows(STUDIO_NAMES, STUDIO_SLUGS)),
+        AnimeFilter.Header("Released year"),
+        YearFilter(),
+        AnimeFilter.Header("Sorting"),
+        SortFilter(),
+    )
+
+    private fun genreRows(names: Array<String>, slugs: Array<String>): Array<GenreFilter> =
+        Array(names.size) { index -> GenreFilter(names[index], slugs[index]) }
+
+    private class FilterGroup(name: String, vararg filters: AnimeFilter<*>) :
+        AnimeFilter.Group<AnimeFilter<*>>(name, filters.toList())
+
+    private class GenreFilter(name: String, val slug: String) :
+        AnimeFilter.TriState(name, AnimeFilter.TriState.STATE_IGNORE)
+
+    private class YearFilter : AnimeFilter.Select<String>("Year", YEAR_NAMES, 0)
+
+    private class SortFilter : AnimeFilter.Select<String>("Sort by", SORT_NAMES, 0)
+
+    private fun flatFilters(filters: AnimeFilterList?): List<AnimeFilter<*>> = filters.orEmpty().flatMap { filter ->
+        if (filter is AnimeFilter.Group<*>) {
+            filter.state.filterIsInstance<AnimeFilter<*>>()
+        } else {
+            listOf(filter)
+        }
+    }
+
+    private fun includedSlugs(filters: AnimeFilterList?): List<String> =
+        flatFilters(filters).filterIsInstance<GenreFilter>()
+            .filter { it.state == AnimeFilter.TriState.STATE_INCLUDE }
+            .map { it.slug }
+
+    private fun excludedSlugs(filters: AnimeFilterList?): Set<String> =
+        flatFilters(filters).filterIsInstance<GenreFilter>()
+            .filter { it.state == AnimeFilter.TriState.STATE_EXCLUDE }
+            .map { it.slug }
+            .toSet()
+
+    /** Genre includes plus the selected year, which the site ANDs via "+". */
+    private fun includedTerms(filters: AnimeFilterList): List<String> {
+        val year = flatFilters(filters).filterIsInstance<YearFilter>().firstOrNull()
+            ?.let { YEAR_NAMES.getOrNull(it.state) }
+            ?.takeIf { it != "All" }
+        return includedSlugs(filters) + listOfNotNull(year)
+    }
+
+    private fun sortSlug(filters: AnimeFilterList): String {
+        val index = flatFilters(filters).filterIsInstance<SortFilter>().firstOrNull()?.state ?: 0
+        return SORT_SLUGS.getOrNull(index) ?: SORT_SLUGS[0]
     }
 
     // ============================== Details ===============================

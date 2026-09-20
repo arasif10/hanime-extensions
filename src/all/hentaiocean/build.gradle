@@ -2,7 +2,7 @@ ext {
     extName = 'HentaiOcean'
     extLabel = 'HentaiOcean'
     extClass = '.HentaiOcean'
-    extVersionCode = 4
+    extVersionCode = 5
     isNsfw = true
 }
 
