@@ -84,13 +84,21 @@ class HentaiPlay : AnimeHttpSource() {
     private fun paginatedAnimesPage(response: Response): AnimesPage {
         val doc = response.asJsoup()
         val animes = doc.select("a.clip-link").mapNotNull(::videoCard)
-        val pages = doc.select("a[href]").mapNotNull { el ->
-            val href = el.attr("href")
-            val m = PAGE_REGEX.find(href) ?: return@mapNotNull null
-            val page = m.groupValues[1].toIntOrNull() ?: return@mapNotNull null
-            if (m.groupValues[2] == "orderby") page else null
+
+        // Pagination links look like /page/2/ (the sorted view adds a query
+        // string: /page/2/?orderby=views, so match the path segment). The
+        // current page comes from the request itself.
+        val current = response.request.url.queryParameter("paged")?.toIntOrNull()
+            ?: PAGE_REGEX.find(response.request.url.encodedPath)
+                ?.groupValues?.get(1)?.toIntOrNull()
+            ?: 1
+        val linked = doc.select("a[href]").mapNotNull { el ->
+            PAGE_REGEX.find(el.attr("href"))?.groupValues?.get(1)?.toIntOrNull()
         }
-        val hasNext = animes.isNotEmpty()
+
+        // Prefer the site's own pager; only fall back to "this page had items"
+        // when a view renders no pagination links at all.
+        val hasNext = if (linked.isNotEmpty()) linked.any { it > current } else animes.isNotEmpty()
         return AnimesPage(animes, hasNext)
     }
 
@@ -178,7 +186,10 @@ class HentaiPlay : AnimeHttpSource() {
     companion object {
         private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
-        private val PAGE_REGEX = Regex("""/(?:page/)?(\d+)/?(?:\?|$)""")
+        // /page/N/ - only the page number is captured (the previous pattern had
+        // a single group while the caller read group 2, which threw
+        // IndexOutOfBoundsException: No group 2 and broke the whole source).
+        private val PAGE_REGEX = Regex("""/page/(\d+)/""")
 
         private val MP4_REGEX = Regex("""https?://[^"'\s]+\.mp4[^"'\s]*""")
     }

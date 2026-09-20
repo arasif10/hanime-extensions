@@ -78,6 +78,22 @@ class HentaiTv : AnimeHttpSource() {
     /** One level of JSON-string unescaping (flight payloads are double-escaped). */
     private fun unescape(html: String): String = html.replace("\\\"", "\"")
 
+    // TriState genre selections from the last search request. The API's
+    // `genres=` param is an OR filter, so it is only used to narrow the pages
+    // and the exact include (AND) / exclude semantics are applied to the
+    // parsed rows, which carry their own tag list.
+    private var includedGenres: List<String> = emptyList()
+    private var excludedGenres: List<String> = emptyList()
+
+    /** Keeps only rows carrying every included genre and no excluded one. */
+    private fun SAnime.matchesGenreFilter(): Boolean {
+        if (includedGenres.isEmpty() && excludedGenres.isEmpty()) return true
+        val tags = genre?.split(",")?.map { it.trim().lowercase() }?.filter { it.isNotEmpty() }.orEmpty()
+        if (tags.isEmpty()) return true
+        return includedGenres.all { tags.contains(it.lowercase()) } &&
+            excludedGenres.none { tags.contains(it.lowercase()) }
+    }
+
     // ============================== Popular ===============================
 
     override fun popularAnimeRequest(page: Int): Request =
@@ -98,9 +114,15 @@ class HentaiTv : AnimeHttpSource() {
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         val params = mutableListOf<String>()
         filters.firstOrNull { it is GenreFilter }?.let {
-            val checked = (it as GenreFilter).state.filter { box -> box.state }.map { box -> box.name }
-            if (checked.isNotEmpty()) {
-                params.add("genres=" + checked.joinToString(",") { g -> URLEncoder.encode(g, "UTF-8") })
+            val boxes = (it as GenreFilter).state
+            includedGenres = boxes
+                .filter { box -> box.state == AnimeFilter.TriState.STATE_INCLUDE }
+                .map { box -> box.name }
+            excludedGenres = boxes
+                .filter { box -> box.state == AnimeFilter.TriState.STATE_EXCLUDE }
+                .map { box -> box.name }
+            if (includedGenres.isNotEmpty()) {
+                params.add("genres=" + includedGenres.joinToString(",") { g -> URLEncoder.encode(g, "UTF-8") })
             }
         }
         filters.firstOrNull { it is SortFilter }?.let {
@@ -114,8 +136,10 @@ class HentaiTv : AnimeHttpSource() {
         return GET("$baseUrl/api/browse?${params.joinToString("&")}", headers)
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage =
-        parseBrowse(response, paginated = false)
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val page = parseBrowse(response, paginated = false)
+        return AnimesPage(page.animes.filter { it.matchesGenreFilter() }, page.hasNextPage)
+    }
 
     /** JSONArray -> List<JSONObject> (org.json arrays are not Kotlin iterables). */
     private fun JSONArray.toObjectList(): List<JSONObject> =
@@ -411,7 +435,9 @@ class HentaiTv : AnimeHttpSource() {
     private class GenreFilter(name: String, values: List<String>) :
         AnimeFilter.Group<GenreCheckbox>(name, values.map { GenreCheckbox(it) })
 
-    private class GenreCheckbox(name: String) : AnimeFilter.CheckBox(name, false)
+    // TriState: one tap includes the genre, a second tap excludes it.
+    private class GenreCheckbox(name: String) :
+        AnimeFilter.TriState(name, AnimeFilter.TriState.STATE_IGNORE)
 
     private class SortFilter(name: String) :
         AnimeFilter.Select<String>(name, SORTS.keys.toTypedArray())

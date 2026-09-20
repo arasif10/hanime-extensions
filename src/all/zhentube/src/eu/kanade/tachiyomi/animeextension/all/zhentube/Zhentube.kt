@@ -13,6 +13,7 @@ import okhttp3.Headers
 import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import java.io.IOException
 import java.net.URLEncoder
 
@@ -61,8 +62,13 @@ class Zhentube : AnimeHttpSource() {
             headers,
         )
 
-    override fun popularAnimeParse(response: Response): AnimesPage =
-        AnimesPage(catalogCards(response), hasMoreCards(response))
+    // okhttp bodies are one-shot: parse the page once and hand the document to
+    // both helpers. Reading response.body twice threw
+    // "IllegalStateException: closed", which broke this whole source.
+    override fun popularAnimeParse(response: Response): AnimesPage {
+        val doc = response.asJsoup()
+        return AnimesPage(catalogCards(doc), hasMoreCards(doc))
+    }
 
     // ============================== Latest ================================
 
@@ -76,8 +82,10 @@ class Zhentube : AnimeHttpSource() {
             headers,
         )
 
-    override fun latestUpdatesParse(response: Response): AnimesPage =
-        AnimesPage(catalogCards(response), hasMoreCards(response))
+    override fun latestUpdatesParse(response: Response): AnimesPage {
+        val doc = response.asJsoup()
+        return AnimesPage(catalogCards(doc), hasMoreCards(doc))
+    }
 
     // ============================== Search ================================
 
@@ -91,13 +99,14 @@ class Zhentube : AnimeHttpSource() {
             latestUpdatesRequest(page)
         }
 
-    override fun searchAnimeParse(response: Response): AnimesPage =
-        AnimesPage(catalogCards(response), hasMoreCards(response))
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val doc = response.asJsoup()
+        return AnimesPage(catalogCards(doc), hasMoreCards(doc))
+    }
 
     // ============================== Catalogue parsing =====================
 
-    private fun catalogCards(response: Response): List<SAnime> {
-        val doc = response.asJsoup()
+    private fun catalogCards(doc: Document): List<SAnime> {
         return doc.select("article.loop-video").mapNotNull { el ->
             val a = el.selectFirst("a[href]") ?: return@mapNotNull null
             val href = a.absUrl("href").ifBlank { a.attr("href") }
@@ -116,8 +125,7 @@ class Zhentube : AnimeHttpSource() {
         }
     }
 
-    private fun hasMoreCards(response: Response): Boolean {
-        val doc = response.asJsoup()
+    private fun hasMoreCards(doc: Document): Boolean {
         return doc.selectFirst("a[rel=next], .pagination a:containsOwn(Next), .pagination a:containsOwn(›)") != null
     }
 
@@ -171,22 +179,16 @@ class Zhentube : AnimeHttpSource() {
     // ============================== Video =================================
 
     override fun videoListRequest(episode: SEpisode): Request {
-        // Step 1: fetch the download page to extract the AES key.
+        // The download page URL carries the video hash used by getVideo.
         return GET("$JAVBEST/download/${episode.url}", javbestHeaders)
     }
 
     override fun videoListParse(response: Response): List<Video> {
-        val dlBody = response.body?.string().orEmpty()
         val id = Regex("""javbest\.cc/download/([a-f0-9]+)""")
             .find(response.request.url.toString())?.groupValues?.get(1)
             ?: throw IOException("Zhentube: missing video id")
-        // Unpack the Dean Edwards packer payload to find the ck key.
-        val packer = Regex("""eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',\s*(\d+),\s*(\d+),\s*'(.*?)'\.split\('\|'\)""", RegexOption.DOT_MATCHES_ALL)
-            .find(dlBody) ?: throw IOException("Zhentube: player packer not found")
-        val key = extractCk(packer.groupValues[1], packer.groupValues[4].split("|"))
-            ?: throw IOException("Zhentube: AES key not found")
 
-        // Step 2: POST getVideo to get the secured HLS link.
+        // The secured HLS link comes from the getVideo endpoint.
         val postBody = FormBody.Builder().add("hash", id).build()
         val req = Request.Builder()
             .url("$JAVBEST/video/$id?do=getVideo")
@@ -200,44 +202,6 @@ class Zhentube : AnimeHttpSource() {
             ?.groupValues?.get(1)?.replace("\\/", "/")
             ?: throw IOException("Zhentube: no securedLink in getVideo response")
         return listOf(Video(secured, "HLS", secured, headers = javbestHeaders))
-    }
-
-    private fun extractCk(payload: String, dict: List<String>): String? {
-        // Base-62 Dean Edwards unpack of the packed payload, then find "ck".
-        val unpacked = unpackPacker(payload, dict)
-        val ckRaw = Regex(""""ck":"([^"]+)"""").find(unpacked)?.groupValues?.get(1) ?: return null
-        // ck is a hex-escaped string that base64-decodes to the AES passphrase.
-        val unescaped = ckRaw.replace("\\\\", "\\")
-            .let { HEX_ESC.replace(it) { m -> m.groupValues[1].toInt(16).toChar().toString() } }
-        return try {
-            val padded = unescaped + "=".repeat((4 - unescaped.length % 4) % 4)
-            String(java.util.Base64.getDecoder().decode(padded))
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun unpackPacker(payload: String, dict: List<String>): String {
-        val sb = StringBuilder()
-        val wordRegex = Regex("""\w+""")
-        var last = 0
-        for (m in wordRegex.findAll(payload)) {
-            sb.append(payload.substring(last, m.range.first))
-            val tok = m.value
-            val idx = tok.fold(0L) { acc, c ->
-                val v = when (c) {
-                    in '0'..'9' -> c - '0'
-                    in 'a'..'z' -> c - 'a' + 10
-                    in 'A'..'Z' -> c - 'A' + 36
-                    else -> return@fold acc * 100 // bail
-                }
-                acc * 62 + v
-            }.toInt()
-            sb.append(if (idx in dict.indices) dict[idx] else tok)
-            last = m.range.last + 1
-        }
-        sb.append(payload.substring(last))
-        return sb.toString()
     }
 
     private val javbestHeaders: Headers by lazy {
@@ -264,7 +228,5 @@ class Zhentube : AnimeHttpSource() {
     companion object {
         private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
         private const val JAVBEST = "https://javbest.cc"
-
-        private val HEX_ESC = Regex("""\\x([0-9a-fA-F]{2})""")
     }
 }

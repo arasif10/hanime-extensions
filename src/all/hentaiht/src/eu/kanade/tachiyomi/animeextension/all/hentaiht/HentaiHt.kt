@@ -86,21 +86,32 @@ class HentaiHt : AnimeHttpSource() {
 
     // ============================== Popular ===============================
 
-    override fun popularAnimeRequest(page: Int): Request = GET("$baseUrl/api/v1/catalog?page=$page", headers)
+    // Every request builder must confirm the age cookie first. Without it the API
+    // answers 403 {"error":"age_confirmation_required"}, and AniZen's Cloudflare
+    // interceptor swallows that 403 and reports "Failed to bypass Cloudflare" -
+    // which is exactly how this source used to break on browse.
+    override fun popularAnimeRequest(page: Int): Request {
+        confirmAge()
+        return GET("$baseUrl/api/v1/catalog?page=$page", headers)
+    }
 
     override fun popularAnimeParse(response: Response): AnimesPage = parseCatalog(response)
 
     // ============================== Latest ================================
 
-    override fun latestUpdatesRequest(page: Int): Request =
-        GET("$baseUrl/api/v1/catalog?page=$page&sort=recent", headers)
+    override fun latestUpdatesRequest(page: Int): Request {
+        confirmAge()
+        return GET("$baseUrl/api/v1/catalog?page=$page&sort=recent", headers)
+    }
 
     override fun latestUpdatesParse(response: Response): AnimesPage = parseCatalog(response)
 
     // ============================== Search ================================
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request =
-        GET("$baseUrl/api/v1/catalog/search?q=${URLEncoder.encode(query, "UTF-8")}", headers)
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        confirmAge()
+        return GET("$baseUrl/api/v1/catalog/search?q=${URLEncoder.encode(query, "UTF-8")}", headers)
+    }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
         val data = json(response.body?.string().orEmpty())
