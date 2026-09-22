@@ -1,6 +1,7 @@
 /*lint:disable:standard:filename*/
 package eu.kanade.tachiyomi.animeextension.all.hentaiht
 
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -108,16 +109,84 @@ class HentaiHt : AnimeHttpSource() {
 
     // ============================== Search ================================
 
+    // The catalogue API takes one value per facet, so a multi-select is served by
+    // fetching one catalogue page per ticked value and merging them (OR). Tag
+    // values are tag names the API validates; studio values come from the rows'
+    // own `studio` field.
+
+    private var lastFilters: AnimeFilterList? = null
+    private var lastPage: Int = 1
+
+    /** Studio printed on each catalogue row, so exclude taps can be honoured. */
+    private val studioFacets = HashMap<String, String>()
+
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        lastFilters = filters
+        lastPage = page
         confirmAge()
-        return GET("$baseUrl/api/v1/catalog/search?q=${URLEncoder.encode(query, "UTF-8")}", headers)
+        if (query.isNotBlank()) {
+            return GET("$baseUrl/api/v1/catalog/search?q=${URLEncoder.encode(query, "UTF-8")}", headers)
+        }
+        return GET(
+            catalogUrl(
+                page,
+                filters,
+                selectedTagNames(filters).firstOrNull(),
+                selectedStudioNames(filters, AnimeFilter.TriState.STATE_INCLUDE).firstOrNull(),
+            ),
+            headers,
+        )
     }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
+        if (response.request.url.encodedPath.contains("/catalog/search")) return searchResultsPage(response)
+        val first = parseCatalog(response)
+        val extraTags = selectedTagNames(lastFilters).drop(1)
+        val extraStudios = selectedStudioNames(lastFilters, AnimeFilter.TriState.STATE_INCLUDE).drop(1)
+        if (extraTags.isEmpty() && extraStudios.isEmpty()) return applyStudioExcludes(first)
+        val merged = LinkedHashMap<String, SAnime>()
+        first.animes.forEach { merged[it.url] = it }
+        var hasMore = first.hasNextPage
+        val extra: List<Pair<String?, String?>> =
+            extraTags.map { Pair(it, null) } + extraStudios.map { Pair(null, it) }
+        extra.forEach { (tag, studio) ->
+            client.newCall(GET(catalogUrl(lastPage, lastFilters, tag, studio), headers)).execute().use { resp ->
+                val page = parseCatalog(resp)
+                page.animes.forEach { merged.putIfAbsent(it.url, it) }
+                hasMore = hasMore || page.hasNextPage
+            }
+        }
+        return applyStudioExcludes(AnimesPage(merged.values.toList(), hasMore))
+    }
+
+    /** Search answers with the full match set; no pagination. */
+    private fun searchResultsPage(response: Response): AnimesPage {
         val data = json(response.body?.string().orEmpty())
         val titles = data.optJSONArray("titles") ?: JSONArray()
-        // The search endpoint returns the full match set; no pagination.
         return AnimesPage(titles.toObjectList().mapNotNull { titleFrom(it) }, false)
+    }
+
+    private fun applyStudioExcludes(page: AnimesPage): AnimesPage {
+        val excluded = selectedStudioNames(lastFilters, AnimeFilter.TriState.STATE_EXCLUDE)
+        if (excluded.isEmpty()) return page
+        return AnimesPage(page.animes.filter { studioFacets[it.url].orEmpty() !in excluded }, page.hasNextPage)
+    }
+
+    /** Builds /api/v1/catalog from the ticked filters, overriding tag/studio when given. */
+    private fun catalogUrl(page: Int, filters: AnimeFilterList?, tag: String?, studio: String?): String {
+        val builder = StringBuilder("$baseUrl/api/v1/catalog?page=$page")
+        tag?.let { builder.append("&tag=").append(URLEncoder.encode(it, "UTF-8")) }
+        studio?.let { builder.append("&studio=").append(URLEncoder.encode(it, "UTF-8")) }
+        appendOption(builder, SORT_PARAM, SORT_SLUGS.getOrNull(selectedIndex<SortFilter>(filters)))
+        appendOption(builder, YEAR_PARAM, YEAR_SLUGS.getOrNull(selectedIndex<YearFilter>(filters)))
+        appendOption(builder, STATUS_PARAM, STATUS_SLUGS.getOrNull(selectedIndex<StatusFilter>(filters)))
+        appendOption(builder, FORMAT_PARAM, FORMAT_SLUGS.getOrNull(selectedIndex<FormatFilter>(filters)))
+        return builder.toString()
+    }
+
+    private fun appendOption(builder: StringBuilder, param: String, slug: String?) {
+        if (slug.isNullOrEmpty()) return
+        builder.append('&').append(param).append('=').append(slug)
     }
 
     // ============================== Catalog ===============================
@@ -134,10 +203,13 @@ class HentaiHt : AnimeHttpSource() {
     private fun titleFrom(t: JSONObject): SAnime? {
         val slug = t.optString("slug").takeIf { it.isNotBlank() } ?: return null
         val routeId = t.optString("routeId").takeIf { it.isNotBlank() } ?: return null
+        val path = "titles/$routeId/$slug"
+        // Remember the row's own studio so an exclude tap can be honoured.
+        t.optString("studio").takeIf { it.isNotBlank() }?.let { studioFacets[path] = it }
         return SAnime.create().apply {
             title = t.optString("name").ifBlank { t.optString("english") }.trim()
             // details/episodes endpoint keyed by route id; slug rides along for playback
-            url = "titles/$routeId/$slug"
+            url = path
             thumbnail_url = t.optString("coverFull").ifBlank { t.optString("cover") }
         }
     }
@@ -238,6 +310,68 @@ class HentaiHt : AnimeHttpSource() {
         .set("Origin", baseUrl)
         .build()
 
+    // ============================== Filters ===============================
+
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
+        AnimeFilter.Header("Filters apply to browse (leave search blank)"),
+        TagGroup(),
+        StudioGroup(),
+        AnimeFilter.Header("Released"),
+        YearFilter(),
+        AnimeFilter.Header("Type & status"),
+        FormatFilter(),
+        StatusFilter(),
+        AnimeFilter.Header("Sorting"),
+        SortFilter(),
+    )
+
+    // The lib's AnimeFilter.CheckBox is abstract, so a concrete subclass is required.
+    private class TagCheckBox(name: String, state: Boolean = false) :
+        AnimeFilter.CheckBox(name, state)
+
+    private class TagGroup : AnimeFilter.Group<AnimeFilter.CheckBox>(
+        "Genres",
+        TAG_NAMES.map { TagCheckBox(it) },
+    )
+
+    // TriState: one tap includes the studio, a second tap excludes it (the rows
+    // carry their own studio, so the exclude is enforced on the parsed result).
+    private class StudioTriState(name: String) :
+        AnimeFilter.TriState(name, AnimeFilter.TriState.STATE_IGNORE)
+
+    private class StudioGroup : AnimeFilter.Group<AnimeFilter.TriState>(
+        "Studios",
+        STUDIO_NAMES.map { StudioTriState(it) },
+    )
+
+    private class YearFilter : AnimeFilter.Select<String>("Year", YEAR_NAMES, 0)
+    private class StatusFilter : AnimeFilter.Select<String>("Status", STATUS_NAMES, 0)
+    private class FormatFilter : AnimeFilter.Select<String>("Format", FORMAT_NAMES, 0)
+    private class SortFilter : AnimeFilter.Select<String>("Sort by", SORT_NAMES, 0)
+
+    private fun flatFilters(filters: AnimeFilterList?): List<AnimeFilter<*>> = filters.orEmpty().flatMap { filter ->
+        if (filter is AnimeFilter.Group<*>) {
+            filter.state.filterIsInstance<AnimeFilter<*>>()
+        } else {
+            listOf(filter)
+        }
+    }
+
+    private fun selectedTagNames(filters: AnimeFilterList?): List<String> =
+        flatFilters(filters).filterIsInstance<TagCheckBox>()
+            .filter { it.state }
+            .map { it.name }
+            .filter { TAG_NAMES.contains(it) }
+
+    private fun selectedStudioNames(filters: AnimeFilterList?, state: Int): List<String> =
+        flatFilters(filters).filterIsInstance<StudioTriState>()
+            .filter { it.state == state }
+            .map { it.name }
+            .filter { STUDIO_NAMES.contains(it) }
+
+    private inline fun <reified T : AnimeFilter.Select<String>> selectedIndex(filters: AnimeFilterList?): Int =
+        flatFilters(filters).filterIsInstance<T>().firstOrNull()?.state ?: 0
+
     // ============================== Helpers ===============================
 
     /** JSONArray -> List<JSONObject> (org.json arrays are not Kotlin iterables). */
@@ -262,5 +396,20 @@ class HentaiHt : AnimeHttpSource() {
 
     companion object {
         private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
+        private const val SORT_PARAM = "sort"
+        private const val YEAR_PARAM = "year"
+        private const val STATUS_PARAM = "status"
+        private const val FORMAT_PARAM = "format"
+
+        // Values accepted by /api/v1/catalog (verified live against the API).
+        private val SORT_NAMES = arrayOf("Default", "Newest", "Score", "Year", "A-Z")
+        private val SORT_SLUGS = arrayOf("", "recent", "score", "year", "alpha")
+
+        private val STATUS_NAMES = arrayOf("Any", "Airing", "Finished")
+        private val STATUS_SLUGS = arrayOf("", "airing", "finished")
+
+        private val FORMAT_NAMES = arrayOf("Any", "OVA", "ONA", "Special")
+        private val FORMAT_SLUGS = arrayOf("", "OVA", "ONA", "SPECIAL")
     }
 }
