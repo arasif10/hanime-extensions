@@ -1,6 +1,7 @@
 /*lint:disable:standard:filename*/
 package eu.kanade.tachiyomi.animeextension.all.hentaistream
 
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -75,21 +76,53 @@ class HentaiStream : AnimeHttpSource() {
 
     // ============================== Search ================================
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request =
+    // Genre browse needs to remember the ticked boxes, because the site takes a
+    // single genre per request and returns the whole match set in one page.
+    private var lastFilters: AnimeFilterList? = null
+
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        lastFilters = filters
         if (query.isNotBlank()) {
-            if (page > 1) {
+            return if (page > 1) {
                 GET("$baseUrl/page/$page/?s=${URLEncoder.encode(query, "UTF-8")}", headers)
             } else {
                 GET("$baseUrl/?s=${URLEncoder.encode(query, "UTF-8")}", headers)
             }
-        } else {
-            GET("$baseUrl/page/$page", headers)
         }
+        val includes = selectedGenres(filters, AnimeFilter.TriState.STATE_INCLUDE)
+        val excludes = selectedGenres(filters, AnimeFilter.TriState.STATE_EXCLUDE)
+        if (includes.isEmpty() && excludes.isEmpty()) return GET("$baseUrl/page/$page", headers)
+        // Only the first included genre is requested here; the rest are merged
+        // in the parse step, since one request carries one response.
+        if (includes.isNotEmpty()) return GET("$baseUrl/genres?genre=${includes.first()}", headers)
+        // Excludes on their own still need a series listing to filter down.
+        return GET("$baseUrl$popularPath", headers)
+    }
 
     override fun searchAnimeParse(response: Response): AnimesPage {
         val doc = response.asJsoup()
         val animes = episodeCards(doc) + seriesCards(doc)
-        return AnimesPage(animes.distinctBy { it.url }, hasNextPage(doc))
+        val path = response.request.url.encodedPath
+        if (!path.startsWith("/genres") && !path.startsWith(popularPath)) {
+            return AnimesPage(animes.distinctBy { it.url }, hasNextPage(doc))
+        }
+        val merged = LinkedHashMap<String, SAnime>()
+        animes.forEach { merged[it.url] = it }
+        selectedGenres(lastFilters, AnimeFilter.TriState.STATE_INCLUDE).drop(1).forEach { slug ->
+            client.newCall(GET("$baseUrl/genres?genre=$slug", headers)).execute().use { resp ->
+                seriesCards(resp.asJsoup()).forEach { merged.putIfAbsent(it.url, it) }
+            }
+        }
+        val excludes = selectedGenres(lastFilters, AnimeFilter.TriState.STATE_EXCLUDE)
+        val rows = if (excludes.isEmpty()) {
+            merged.values.toList()
+        } else {
+            // Honour the exclude taps against each row's own "Genre(s):" line.
+            merged.values.filter { anime ->
+                genreFacets[anime.url].orEmpty().none { it in excludes }
+            }
+        }
+        return AnimesPage(rows, hasNextPage(doc))
     }
 
     // =========================== Card parsing =============================
@@ -131,16 +164,19 @@ class HentaiStream : AnimeHttpSource() {
         val title = link.text().trim()
             .ifBlank { img?.attr("alt")?.removePrefix("HentaiStream.com ")?.trim().orEmpty() }
         if (title.isBlank()) return null
+        // The card prints the site's genre labels verbatim, which is what makes
+        // the filter's exclude taps enforceable without extra requests.
+        val genreList = select("p.tags").text()
+            .substringAfter("Genre(s):", "")
+            .split(",").map { it.trim() }.filter { it.isNotBlank() }
+        genreFacets[path] = genreList.toSet()
         return SAnime.create().apply {
             this.title = title
             url = path
             thumbnail_url = img?.attr("src")?.takeIf { it.startsWith("http") }
             description = selectFirst("div.views")?.text()?.substringAfter("Description:", "")?.trim()
                 ?.takeIf { it.isNotBlank() }
-            genre = select("p.tags").text()
-                .substringAfter("Genre(s):", "")
-                .split(",").map { it.trim() }.filter { it.isNotBlank() }
-                .take(10).joinToString(", ").ifBlank { null }
+            genre = genreList.take(10).joinToString(", ").ifBlank { null }
         }
     }
 
@@ -278,6 +314,38 @@ class HentaiStream : AnimeHttpSource() {
         headers.newBuilder()
             .set("Referer", pageUrl)
             .build()
+
+    // ============================== Filters ===============================
+
+    /** Genre labels per series slug, captured while parsing the listing. */
+    private val genreFacets = HashMap<String, Set<String>>()
+
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
+        AnimeFilter.Header("Filters apply to browse (leave search blank)"),
+        GenreFilter("Genres", GENRE_NAMES.toList()),
+    )
+
+    private class GenreFilter(name: String, values: List<String>) :
+        AnimeFilter.Group<GenreCheckbox>(name, values.map { GenreCheckbox(it) })
+
+    // TriState: one tap includes the genre, a second tap excludes it.
+    private class GenreCheckbox(name: String) :
+        AnimeFilter.TriState(name, AnimeFilter.TriState.STATE_IGNORE)
+
+    private fun flatFilters(filters: AnimeFilterList?): List<AnimeFilter<*>> = filters.orEmpty().flatMap { filter ->
+        if (filter is AnimeFilter.Group<*>) {
+            filter.state.filterIsInstance<AnimeFilter<*>>()
+        } else {
+            listOf(filter)
+        }
+    }
+
+    private fun selectedGenres(filters: AnimeFilterList?, state: Int): List<String> =
+        flatFilters(filters).filterIsInstance<AnimeFilter.TriState>()
+            .filter { it.state == state }
+            .map { it.name }
+            .mapNotNull { name -> GENRE_NAMES.indexOf(name).takeIf { it >= 0 } }
+            .map { GENRE_SLUGS[it] }
 
     // ============================== Helpers ===============================
 

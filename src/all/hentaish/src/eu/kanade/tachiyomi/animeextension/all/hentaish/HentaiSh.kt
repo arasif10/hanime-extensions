@@ -1,6 +1,7 @@
 /*lint:disable:standard:filename*/
 package eu.kanade.tachiyomi.animeextension.all.hentaish
 
+import eu.kanade.tachiyomi.animesource.model.AnimeFilter
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
 import eu.kanade.tachiyomi.animesource.model.SAnime
@@ -66,21 +67,58 @@ class HentaiSh : AnimeHttpSource() {
 
     // ============================== Search ================================
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request =
+    // The site's own filter page is /browse?tag=<name> and it takes a single
+    // tag, so a multi-select is served by fetching one listing per ticked tag
+    // and merging them (OR). The parse step therefore needs to remember which
+    // tags were ticked and which page it is on.
+    private var lastFilters: AnimeFilterList? = null
+    private var lastPage: Int = 1
+
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        lastFilters = filters
+        lastPage = page
         if (query.isNotBlank()) {
-            GET(
+            return GET(
                 "$baseUrl/".toHttpUrl().newBuilder()
                     .addQueryParameter("s", query)
                     .addQueryParameter("page", page.toString())
                     .build(),
                 headers,
             )
-        } else {
-            GET("$baseUrl/?page=$page", headers)
         }
+        val tags = selectedTags(filters)
+        val sort = sortSlug(filters)
+        if (tags.isEmpty() && sort.isEmpty()) return GET("$baseUrl/?page=$page", headers)
+        // Only the first tag is fetched here; the rest are merged in the parse step.
+        return GET(browseUrl(page, tags.firstOrNull(), sort), headers)
+    }
 
-    override fun searchAnimeParse(response: Response): AnimesPage =
-        paginatedAnimesPage(response)
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        if (!response.request.url.toString().contains("/browse")) return paginatedAnimesPage(response)
+        val first = paginatedAnimesPage(response)
+        val rest = selectedTags(lastFilters).drop(1)
+        if (rest.isEmpty()) return first
+        val sort = sortSlug(lastFilters ?: AnimeFilterList())
+        val merged = LinkedHashMap<String, SAnime>()
+        first.animes.forEach { merged[it.url] = it }
+        var hasMore = first.hasNextPage
+        rest.forEach { tag ->
+            client.newCall(GET(browseUrl(lastPage, tag, sort), headers)).execute().use { resp ->
+                val page = paginatedAnimesPage(resp)
+                page.animes.forEach { merged.putIfAbsent(it.url, it) }
+                hasMore = hasMore || page.hasNextPage
+            }
+        }
+        return AnimesPage(merged.values.toList(), hasMore)
+    }
+
+    private fun browseUrl(page: Int, tag: String?, sort: String): okhttp3.HttpUrl {
+        val builder = "$baseUrl/browse".toHttpUrl().newBuilder()
+            .addQueryParameter("page", page.toString())
+        tag?.let { builder.addQueryParameter("tag", it) }
+        if (sort.isNotEmpty()) builder.addQueryParameter("sort", sort)
+        return builder.build()
+    }
 
     // ============================== Catalogue parsing =====================
 
@@ -190,6 +228,44 @@ class HentaiSh : AnimeHttpSource() {
             ?.takeIf { it.startsWith("http") }
             ?: throw IOException("HentaiSh: HLS master not found in page")
         return listOf(Video(master, "HLS", master, headers = headers))
+    }
+
+    // ============================== Filters ===============================
+
+    override fun getFilterList(): AnimeFilterList = AnimeFilterList(
+        TagGroup(),
+        AnimeFilter.Header("Sorting"),
+        SortFilter(),
+    )
+
+    // The lib's AnimeFilter.CheckBox is abstract, so a concrete subclass is required.
+    private class TagCheckBox(name: String, state: Boolean = false) :
+        AnimeFilter.CheckBox(name, state)
+
+    private class TagGroup : AnimeFilter.Group<AnimeFilter.CheckBox>(
+        "Genres",
+        TAG_NAMES.map { TagCheckBox(it) },
+    )
+
+    private class SortFilter : AnimeFilter.Select<String>("Sort by", SORT_NAMES, 0)
+
+    private fun flatFilters(filters: AnimeFilterList?): List<AnimeFilter<*>> = filters.orEmpty().flatMap { filter ->
+        if (filter is AnimeFilter.Group<*>) {
+            filter.state.filterIsInstance<AnimeFilter<*>>()
+        } else {
+            listOf(filter)
+        }
+    }
+
+    private fun selectedTags(filters: AnimeFilterList?): List<String> =
+        flatFilters(filters).filterIsInstance<AnimeFilter.CheckBox>()
+            .filter { it.state }
+            .map { it.name }
+            .filter { TAG_NAMES.contains(it) }
+
+    private fun sortSlug(filters: AnimeFilterList): String {
+        val index = flatFilters(filters).filterIsInstance<SortFilter>().firstOrNull()?.state ?: 0
+        return SORT_SLUGS.getOrNull(index) ?: ""
     }
 
     // ============================== Helpers ===============================
