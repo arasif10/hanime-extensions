@@ -15,6 +15,7 @@ import eu.kanade.tachiyomi.animesource.model.Video
 import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
@@ -46,7 +47,13 @@ import java.util.Locale
  *  - `sort` may only be combined with `genre`. Mixing it with `search`, `tag`,
  *    `author` or `release` returns HTTP 400 ("These filters cannot be combined
  *    with a catalogue sort"), so the sort is dropped in those cases.
- *  - Multiple taxonomy filters are AND-ed together.
+ *  - The API takes exactly ONE value per taxonomy facet (`genre=1,2` -> HTTP 400,
+ *    `genre[]=` -> HTTP 403), so several picks inside one filter group are fetched
+ *    as separate requests and merged (OR), while picks in different groups pin the
+ *    first value of each and therefore combine with each other (AND).
+ *  - Every API row carries its own taxonomy id arrays (wp-manga-genre/-author/
+ *    -release/-tag), which is what makes exclusion exact: a title is dropped when
+ *    any of its ids is on an excluded list. No guesswork, no extra requests.
  *  - per_page is capped at 48; filter IDs must be positive integers.
  *
  * Video streams: the watch page embeds an octopus stream UUID (a different one per
@@ -116,19 +123,64 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
     }
 
     private fun parseCatalogue(response: Response): AnimesPage {
-        val page = response.request.url.queryParameter("page")?.toIntOrNull() ?: 1
+        val (rows, hasNextPage) = parseRows(response)
+        return AnimesPage(rows.map { it.anime }, hasNextPage)
+    }
 
-        val root = json.parseToJsonElement(response.body.string()).jsonObject
+    /**
+     * One catalogue row plus the taxonomy ids the API attaches to it.
+     *
+     * The ids are what exclusion runs on: a row is filtered out when any of its
+     * genre/studio/year/tag ids appears on the corresponding exclude list, which is
+     * the only way to honour an exclude tap on an API that cannot express "not".
+     */
+    private class CatalogueRow(
+        val anime: SAnime,
+        val genres: Set<Int>,
+        val studios: Set<Int>,
+        val years: Set<Int>,
+        val tags: Set<Int>,
+    ) {
+        fun excludedBy(excluded: Map<Facet, Set<Int>>): Boolean =
+            excluded[Facet.GENRE].orEmpty().any { it in genres } ||
+                excluded[Facet.STUDIO].orEmpty().any { it in studios } ||
+                excluded[Facet.YEAR].orEmpty().any { it in years } ||
+                excluded[Facet.TAG].orEmpty().any { it in tags }
+    }
+
+    /** Parses one catalogue response into rows; the body may only be read once. */
+    private fun parseRows(response: Response): Pair<List<CatalogueRow>, Boolean> {
+        val page = response.request.url.queryParameter("page")?.toIntOrNull() ?: 1
+        val body = response.body?.string().orEmpty()
+        if (body.isBlank()) return emptyList<CatalogueRow>() to false
+
+        val root = runCatching { json.parseToJsonElement(body).jsonObject }.getOrNull()
+            ?: return emptyList<CatalogueRow>() to false
         root["error"]?.jsonPrimitive?.content?.let { error ->
             throw Exception("HentaiHaven: $error")
         }
-        val entries = root["data"]?.jsonArray ?: return AnimesPage(emptyList(), false)
-        val animeList = entries.mapNotNull { entry ->
-            runCatching { hitToAnime(entry.jsonObject) }.getOrNull()
+        val entries = root["data"]?.jsonArray ?: return emptyList<CatalogueRow>() to false
+        val rows = entries.mapNotNull { entry ->
+            runCatching {
+                val hit = entry.jsonObject
+                CatalogueRow(
+                    anime = hitToAnime(hit),
+                    genres = hit.termIds("wp-manga-genre"),
+                    studios = hit.termIds("wp-manga-author"),
+                    years = hit.termIds("wp-manga-release"),
+                    tags = hit.termIds("wp-manga-tag"),
+                )
+            }.getOrNull()
         }
         val totalPages = root["totalPages"]?.jsonPrimitive?.content?.toIntOrNull() ?: 1
-        return AnimesPage(animeList, page < totalPages)
+        return rows to (page < totalPages)
     }
+
+    private fun JsonObject.termIds(key: String): Set<Int> =
+        (this[key] as? JsonArray)
+            ?.mapNotNull { runCatching { it.jsonPrimitive.content.toIntOrNull() }.getOrNull() }
+            ?.toSet()
+            .orEmpty()
 
     private fun hitToAnime(hit: JsonObject): SAnime = SAnime.create().apply {
         val slug = hit["slug"]?.jsonPrimitive?.content ?: ""
@@ -228,16 +280,24 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
 
     // ============================== Search ==============================
 
-    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val genre = filters.filterIsInstance<GenreFilter>().firstOrNull()?.selectedId
-        val tag = filters.filterIsInstance<TagFilter>().firstOrNull()?.selectedId
-        val studio = filters.filterIsInstance<StudioFilter>().firstOrNull()?.selectedId
-        val year = filters.filterIsInstance<YearFilter>().firstOrNull()?.selectedId
-        val trimmed = query.trim()
-        val sortFilter = filters.filterIsInstance<SortFilter>().firstOrNull()
+    // The picker lives in AniZen, the merge happens in the parse step, so the
+    // selection has to survive between the two calls.
+    private var lastFilters: AnimeFilterList? = null
+    private var lastPage: Int = 1
 
-        val hasFilter = genre != null || tag != null || studio != null || year != null
-        val unfiltered = trimmed.isEmpty() && !hasFilter
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
+        lastFilters = filters
+        lastPage = page
+
+        val trimmed = query.trim()
+        val genres = selected(filters, Facet.GENRE)
+        val studios = selected(filters, Facet.STUDIO)
+        val years = selected(filters, Facet.YEAR)
+        val tags = selected(filters, Facet.TAG)
+        val unfiltered = trimmed.isEmpty() &&
+            genres.isEmpty() && studios.isEmpty() && years.isEmpty() && tags.isEmpty()
+
+        val sortFilter = filters.filterIsInstance<SortFilter>().firstOrNull()
 
         // The two trending orderings come from the ranking endpoint, which rejects any
         // other parameter, so they only apply to plain browsing.
@@ -245,24 +305,85 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
             return catalogueRequest(page, trendingPeriod = period)
         }
 
-        // `sort` itself may only be combined with `genre`; pairing it with a text search
-        // or with the tag/studio/year filters is a hard error.
-        val sortable = trimmed.isEmpty() && tag == null && studio == null && year == null
+        // `sort` itself may only travel with `genre`; pairing it with a text search or
+        // with the tag/studio/year facets is rejected (HTTP 400), so it is dropped.
+        val sortable = trimmed.isEmpty() && studios.isEmpty() && years.isEmpty() && tags.isEmpty()
         val sort = sortFilter?.sortValue?.takeIf { sortable }
 
+        // One value per facet in the request; any further pick is merged in the parse.
         return catalogueRequest(
             page = page,
             sort = sort,
             search = trimmed.ifEmpty { null },
-            genre = genre,
-            tag = tag,
-            studio = studio,
-            year = year,
+            genre = genres.firstOrNull(),
+            tag = tags.firstOrNull(),
+            studio = studios.firstOrNull(),
+            year = years.firstOrNull(),
         )
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage =
-        parseCatalogue(response)
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val (rows, firstHasNext) = parseRows(response)
+        val merged = LinkedHashMap<String, CatalogueRow>()
+        rows.forEach { merged[it.anime.url] = it }
+        var hasNextPage = firstHasNext
+
+        extraSelectionRequests().forEach { request ->
+            runCatching {
+                client.newCall(request).execute().use { extra ->
+                    val (extraRows, extraHasNext) = parseRows(extra)
+                    extraRows.forEach { merged.putIfAbsent(it.anime.url, it) }
+                    hasNextPage = hasNextPage || extraHasNext
+                }
+            }
+        }
+
+        val filters = lastFilters
+        val excluded = Facet.values().associateWith { excludedTerms(filters, it) }
+        val animes = if (excluded.values.all { it.isEmpty() }) {
+            merged.values.map { it.anime }
+        } else {
+            merged.values.filterNot { it.excludedBy(excluded) }.map { it.anime }
+        }
+        return AnimesPage(animes, hasNextPage)
+    }
+
+    /**
+     * One request per extra pick, with every other facet pinned to its first pick.
+     *
+     * The API cannot take two values for the same facet, so a second ticked genre has
+     * to be fetched separately and merged. Capped so a large selection cannot turn a
+     * single page load into dozens of requests.
+     */
+    private fun extraSelectionRequests(): List<Request> {
+        val filters = lastFilters ?: return emptyList()
+        val genres = selected(filters, Facet.GENRE)
+        val studios = selected(filters, Facet.STUDIO)
+        val years = selected(filters, Facet.YEAR)
+        val tags = selected(filters, Facet.TAG)
+
+        val sortFilter = filters.filterIsInstance<SortFilter>().firstOrNull()
+        val sortable = studios.isEmpty() && years.isEmpty() && tags.isEmpty()
+        val sort = sortFilter?.sortValue?.takeIf { sortable }
+
+        val requests = mutableListOf<Request>()
+        fun pin(facet: Facet, id: Int) {
+            if (requests.size >= MAX_MERGE_REQUESTS) return
+            requests += catalogueRequest(
+                page = lastPage,
+                sort = sort,
+                genre = if (facet == Facet.GENRE) id else genres.firstOrNull(),
+                tag = if (facet == Facet.TAG) id else tags.firstOrNull(),
+                studio = if (facet == Facet.STUDIO) id else studios.firstOrNull(),
+                year = if (facet == Facet.YEAR) id else years.firstOrNull(),
+            )
+        }
+        genres.drop(1).forEach { pin(Facet.GENRE, it) }
+        studios.drop(1).forEach { pin(Facet.STUDIO, it) }
+        years.drop(1).forEach { pin(Facet.YEAR, it) }
+        tags.drop(1).forEach { pin(Facet.TAG, it) }
+        return requests
+    }
 
     // ============================== Filters ==============================
 
@@ -288,34 +409,52 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
             }
     }
 
-    /** Base class for the taxonomy dropdowns; state 0 always means "no filter". */
-    private open class TermFilter(
-        name: String,
-        private val terms: Array<Pair<Int, String>>,
-    ) : AnimeFilter.Select<String>(name, terms.map { it.second }.toTypedArray(), 0) {
-        val selectedId: Int?
-            get() = terms.getOrNull(state)?.first?.takeIf { it > 0 }
-    }
+    /** Which taxonomy a row belongs to; exclusion and pinning both key off this. */
+    private enum class Facet { GENRE, STUDIO, YEAR, TAG }
 
-    private class GenreFilter : TermFilter("Genre", GENRES)
+    /** One row per taxonomy term: tap to include, tap again to exclude. */
+    private class TermFilter(name: String, val termId: Int, val facet: Facet) :
+        AnimeFilter.TriState(name, AnimeFilter.TriState.STATE_IGNORE)
 
-    private class TagFilter : TermFilter("Tag", TAGS)
-
-    private class StudioFilter : TermFilter("Studio", STUDIOS)
-
-    private class YearFilter : TermFilter("Release year", YEARS)
+    private class TermGroup(name: String, terms: List<Pair<Int, String>>, facet: Facet) :
+        AnimeFilter.Group<AnimeFilter<*>>(name, terms.map { TermFilter(it.second, it.first, facet) })
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
         SortFilter(),
         AnimeFilter.Separator(),
-        AnimeFilter.Header("The filters below are combined (AND)"),
-        GenreFilter(),
-        TagFilter(),
-        StudioFilter(),
-        YearFilter(),
+        AnimeFilter.Header("Tap to include (blue), tap again to exclude (red)"),
+        AnimeFilter.Header("Picks inside a group are combined; groups AND together"),
+        AnimeFilter.Header("Exclusions are exact - matched on each title's own terms"),
+        TermGroup("Genres", GENRES, Facet.GENRE),
+        TermGroup("Studios", STUDIOS, Facet.STUDIO),
+        TermGroup("Released year", YEARS, Facet.YEAR),
+        TermGroup("Tags", TAGS, Facet.TAG),
         AnimeFilter.Separator(),
-        AnimeFilter.Header("Trending sorts apply to plain browsing only; picking any filter below falls back to Latest/Most viewed/Top rated"),
+        AnimeFilter.Header("Trending sorts apply to plain browsing only; picking any filter falls back to Latest/Most viewed/Top rated"),
     )
+
+    private fun flatFilters(filters: AnimeFilterList?): List<AnimeFilter<*>> =
+        filters.orEmpty().flatMap { filter ->
+            if (filter is AnimeFilter.Group<*>) {
+                filter.state.filterIsInstance<AnimeFilter<*>>()
+            } else {
+                listOf(filter)
+            }
+        }
+
+    /** Ids ticked into this facet. */
+    private fun selected(filters: AnimeFilterList?, facet: Facet): List<Int> =
+        termsInState(filters, facet, AnimeFilter.TriState.STATE_INCLUDE)
+
+    /** Ids crossed out in this facet. */
+    private fun excludedTerms(filters: AnimeFilterList?, facet: Facet): Set<Int> =
+        termsInState(filters, facet, AnimeFilter.TriState.STATE_EXCLUDE).toSet()
+
+    private fun termsInState(filters: AnimeFilterList?, facet: Facet, state: Int): List<Int> =
+        flatFilters(filters)
+            .filterIsInstance<TermFilter>()
+            .filter { it.facet == facet && it.state == state }
+            .map { it.termId }
 
     // ============================== Anime Details ==============================
 
@@ -642,6 +781,9 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
         private const val TRENDING_PERIOD_MONTHLY = "monthly"
         private const val TRENDING_PERIOD_ALL = "all"
 
+        /** Upper bound on merge requests for one page load. */
+        private const val MAX_MERGE_REQUESTS = 12
+
         private val SLUG_REGEX = Regex("""/watch/([^/]+)""")
         private val EPISODE_REGEX = Regex("""episode-(\d+)""")
         private val HEIGHT_REGEX = Regex("""(\d+)p""")
@@ -661,283 +803,5 @@ class HentaiHaven : ConfigurableAnimeSource, AnimeHttpSource() {
         private val DATE_FORMATTER by lazy {
             SimpleDateFormat("yyyy/MM/dd", Locale.ENGLISH)
         }
-
-        // wp-manga-genre term IDs, from cms.hentaihaven.xxx/wp-json/wp/v2/wp-manga-genre
-        private val GENRES = arrayOf(
-            0 to "Any genre",
-            2245 to "3D Hentai",
-            11709 to "Ahegao",
-            222 to "Anal",
-            2433 to "BBW",
-            133 to "BDSM",
-            252 to "Beastiality",
-            11713 to "Big Boobs",
-            11719 to "Big Breasts",
-            11730 to "Big Tits",
-            11711 to "Blow Job",
-            11720 to "Blowjob",
-            11712 to "Censored",
-            11729 to "Cheating",
-            11725 to "Comedy",
-            11726 to "Corruption",
-            11710 to "Creampie",
-            2594 to "Ecchi",
-            11734 to "Elf",
-            11738 to "Erotic Game",
-            11718 to "Exhibitionism",
-            11716 to "Fantasy",
-            2673 to "FemBoy",
-            2676 to "Femdom",
-            165 to "Furry",
-            229 to "Futanari",
-            2582 to "Gender Bender Hentai",
-            11740 to "Group Sex",
-            11736 to "Gyaru",
-            105 to "Harem",
-            11721 to "HD",
-            11724 to "Hentai",
-            815 to "Hentai School",
-            1606 to "Horror",
-            11735 to "Impregnation",
-            64 to "Incest Hentai",
-            11715 to "Masturbation",
-            208 to "Milf",
-            11733 to "Mind Break",
-            290 to "Monster",
-            11728 to "NTR",
-            11717 to "Nudity",
-            11727 to "Office Lady",
-            11722 to "Paizuri",
-            65 to "Rape",
-            103 to "Romance",
-            11714 to "School",
-            11732 to "Schoolgirl",
-            11731 to "Sex Toys",
-            2627 to "Softcore",
-            11737 to "Teasing",
-            66 to "Teen Hentai",
-            244 to "Tentacle",
-            106 to "Tsundere",
-            2605 to "Umemaro 3D",
-            107 to "Uncensored Hentai",
-            104 to "Yaoi",
-            67 to "Young Hentai",
-            102 to "Yuri",
-        )
-
-        // wp-manga-author term IDs (the site labels these "Studio")
-        private val STUDIOS = arrayOf(
-            0 to "Any studio",
-            1709 to "@Oz",
-            1301 to "Amour",
-            2200 to "Animac",
-            1027 to "Arms",
-            2427 to "BOMB! CUTE! BOMB!",
-            1048 to "Bootleg",
-            199 to "Bunnywalker",
-            2576 to "Central Park Media",
-            936 to "ChiChinoya",
-            209 to "Collaboration Works",
-            2243 to "Comic Media",
-            1710 to "Digital Works",
-            883 to "Discovery",
-            223 to "Edge",
-            816 to "Five Ways",
-            2447 to "GOLD BEAR",
-            1019 to "Green Bunny",
-            2130 to "Hoods Entertainment",
-            2421 to "Hot Bear",
-            2762 to "Jellyfish",
-            2620 to "King Bee",
-            1146 to "Lune Pictures",
-            1939 to "Magic Bus",
-            134 to "Magin Label",
-            2349 to "Majin Petit",
-            2153 to "Marigold",
-            301 to "Mary Jane",
-            228 to "MediaBank",
-            782 to "Milky",
-            231 to "MS Pictures",
-            2581 to "Nihikime no Dozeu",
-            2579 to "nur",
-            2601 to "NuTech Digital",
-            923 to "Pashmina",
-            167 to "Pink Pineapple",
-            262 to "Pixy Soft",
-            69 to "PoRO",
-            472 to "Queen Bee",
-            2641 to "Rabbit Gate",
-            1035 to "Schoolzone",
-            275 to "SELFISH",
-            2631 to "Seven",
-            1714 to "Showten",
-            2645 to "Soft on Demand",
-            920 to "Studio 9 Maiami",
-            2592 to "Studio FOW",
-            1711 to "Studio Hokiboshi",
-            2678 to "Suiseisha",
-            864 to "Suzuki Mirano",
-            2663 to "t japan",
-            1041 to "T-Rex",
-            2634 to "Toranoana",
-            2829 to "Torudaya",
-            2608 to "Umemaro 3D",
-            2544 to "Valkyria",
-            829 to "Vanilla",
-            2583 to "White Bear",
-            2644 to "Y.O.U.C",
-            345 to "ZIZ",
-        )
-
-        // wp-manga-release term IDs
-        private val YEARS = arrayOf(
-            0 to "Any year",
-            11708 to "2026",
-            11700 to "2025",
-            11308 to "2024",
-            2681 to "2023",
-            2656 to "2022",
-            2593 to "2021",
-            1930 to "2020",
-            879 to "2019",
-            198 to "2018",
-            142 to "2017",
-            113 to "2016",
-            111 to "2015",
-            166 to "2014",
-            112 to "2013",
-            361 to "2012",
-            114 to "2011",
-            110 to "2010",
-            68 to "2009",
-            261 to "2008",
-            318 to "2007",
-            1199 to "2006",
-            1026 to "2005",
-            882 to "2004",
-            1018 to "2003",
-            1118 to "2002",
-            781 to "2001",
-            2610 to "2000",
-            828 to "1999",
-            2643 to "1998",
-            1579 to "1997",
-            1614 to "1996",
-            2604 to "1995",
-            2759 to "1994",
-            2575 to "1992",
-            2625 to "1991",
-        )
-
-        // wp-manga-tag term IDs. The taxonomy also holds ~30 SEO tags applied to the
-        // whole catalogue ("Hentai Stream", "nHentai", ...) plus near-duplicates; only
-        // the useful content tags are listed here.
-        private val TAGS = arrayOf(
-            0 to "Any tag",
-            2249 to "3D",
-            176 to "Ahegao",
-            225 to "Anal",
-            153 to "Ass",
-            135 to "BDSM",
-            155 to "Big Ass",
-            144 to "Big Boobs",
-            76 to "Big Tits",
-            207 to "Black Women",
-            2689 to "Blackmail",
-            87 to "Blow Job",
-            139 to "Bondage",
-            1365 to "Boob Job",
-            2623 to "Breasts",
-            2695 to "Bukkake",
-            2635 to "Cheating",
-            177 to "Cosplay",
-            205 to "Cum in Pussy",
-            363 to "Demon",
-            2688 to "Doggy Style",
-            2685 to "Dominatrix",
-            362 to "Elf",
-            2693 to "Erotic Asphyxiation",
-            2721 to "Erotic Game",
-            2683 to "Exhibitionism",
-            136 to "Extreme",
-            148 to "Facial",
-            172 to "Fantasy",
-            2666 to "Femdom",
-            1500 to "Foot Job",
-            175 to "Furry",
-            230 to "Futanari",
-            233 to "Gangbang",
-            2070 to "Gay",
-            820 to "Glasses",
-            403 to "Hair Pussy",
-            819 to "Hand Job",
-            77 to "Harem",
-            2758 to "High School",
-            256 to "Horror",
-            33 to "Incest",
-            243 to "Inflation",
-            2704 to "Internal Shots",
-            364 to "Interracial",
-            214 to "Lactation",
-            2725 to "Large Breasts",
-            868 to "Lesbian",
-            2690 to "Lingerie",
-            922 to "Little Girl",
-            84 to "Maid",
-            2702 to "Mammary Intercourse",
-            1902 to "Massage",
-            81 to "Masturbation",
-            147 to "Mature",
-            154 to "Milf",
-            2652 to "Milk",
-            1931 to "Mind Break",
-            88 to "Mind Control",
-            2692 to "Mother-Son Incest",
-            247 to "Monster",
-            224 to "NTR",
-            2691 to "Nudity",
-            937 to "Nurse",
-            203 to "Oral Sex",
-            204 to "Orgy",
-            2654 to "Paizuri",
-            297 to "POV",
-            294 to "Pregnant",
-            171 to "Public Sex",
-            70 to "Rape",
-            810 to "Redhead",
-            255 to "Reverse Rape",
-            2469 to "Riding",
-            1278 to "RimJob",
-            78 to "Romance",
-            83 to "School",
-            74 to "School Girl",
-            2682 to "Sexual Fantasies",
-            79 to "Shotacon",
-            1829 to "Sister",
-            309 to "Small Tits",
-            2637 to "Softcore",
-            2438 to "Squirt",
-            2694 to "Submission",
-            818 to "Swimsuit",
-            2730 to "Teacher x Student",
-            108 to "Teens",
-            246 to "Tentacle",
-            293 to "Tentacle Rape",
-            2400 to "Threesome",
-            82 to "Tits",
-            170 to "Toys",
-            1390 to "Trap",
-            865 to "Ugly Bastard",
-            7 to "Uncensored",
-            830 to "Vanilla",
-            2679 to "Violation",
-            80 to "Virgin",
-            426 to "Warrior",
-            206 to "Wet Pussy",
-            1601 to "X Ray",
-            85 to "Yaoi",
-            72 to "Young",
-            75 to "Yuri",
-        )
     }
 }
