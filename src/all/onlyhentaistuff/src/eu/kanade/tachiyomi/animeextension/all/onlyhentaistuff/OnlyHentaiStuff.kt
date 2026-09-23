@@ -75,59 +75,90 @@ class OnlyHentaiStuff : AnimeHttpSource() {
 
     // ============================== Search ================================
 
+    // The picker runs in the app and the merge runs in the parse step, so the
+    // selection has to survive between the two calls.
+    private var pendingMerge: MergePlan? = null
+
+    private class MergePlan(val urls: List<String>)
+
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val sort = (
-            filters.filterIsInstance<SortFilter>().firstOrNull()?.selected()
-                ?: SORTS[0].second
-            )
-        val categoryId = filters.filterIsInstance<CategoryFilter>().firstOrNull()?.selectedId()
-            ?: ""
-        val tag = filters.filterIsInstance<TagFilter>().firstOrNull()?.state
-            ?.trim()?.lowercase()?.replace(Regex("\\s+"), "-")
-            ?: ""
-        val model = filters.filterIsInstance<StudioFilter>().firstOrNull()?.state
-            ?.trim()?.lowercase()?.replace(Regex("\\s+"), "-")
-            ?: ""
+        val sort = filters.filterIsInstance<SortFilter>().firstOrNull()?.selected() ?: SORTS[0].second
+        val categories = picked(filters).filterIsInstance<CategoryFilter>().map { it.slug }
+        val tags = picked(filters).filterIsInstance<TagFilter>().map { it.slug }
+        val models = picked(filters).filterIsInstance<ModelFilter>().map { it.slug }
         val q = query.trim()
 
-        // Tag / studio browsing behave like category pages: plain URL + sort query.
         if (q.isBlank()) {
-            if (tag.isNotEmpty()) return GET(browseUrl("$baseUrl/tags/$tag", sort, page), headers)
-            if (model.isNotEmpty()) return GET(browseUrl("$baseUrl/models/$model", sort, page), headers)
-            if (categoryId.isNotEmpty()) {
-                val slug = CATEGORY_SLUGS[categoryId.toIntOrNull()]
-                if (slug != null) return GET(browseUrl("$baseUrl/categories/$slug", sort, page), headers)
+            // Tag, model and category browsing are all plain URLs on this site, so
+            // every ticked box contributes its own listing and the results are merged.
+            val bases = buildList {
+                tags.forEach { add("$baseUrl/tags/$it") }
+                models.forEach { add("$baseUrl/models/$it") }
+                categories.forEach { add("$baseUrl/categories/$it") }
             }
-            if (sort.isNotEmpty() || categoryId.isNotEmpty()) {
-                return GET(buildSearchUrl("", categoryId, sort, 1), ajaxHeaders)
+            if (bases.isNotEmpty()) {
+                pendingMerge = if (bases.size > 1) {
+                    MergePlan(bases.drop(1).map { browseUrl(it, sort, page) })
+                } else {
+                    null
+                }
+                return GET(browseUrl(bases.first(), sort, page), headers)
             }
+            // Sorting on its own still goes through the async block.
+            if (sort.isNotEmpty()) return GET(buildSearchUrl("", "", sort, 1), ajaxHeaders)
             return popularAnimeRequest(page)
         }
+
+        // A text query searches the whole catalogue. Category picks still narrow it,
+        // through the numeric ids the async block expects, for the categories whose id
+        // is known; the rest simply do not apply to a text search.
+        val categoryIds = categories
+            .mapNotNull { slug -> CATEGORY_SLUGS.entries.firstOrNull { it.value == slug }?.key }
+            .joinToString(",")
 
         if (page > 1) {
             // The ?mode=async search block ignores from_pages; the working
             // page cursor is `from_videos` (verified: returns page 2 content).
-            return GET(buildSearchUrl(q, categoryId, sort, page), ajaxHeaders)
+            return GET(buildSearchUrl(q, categoryIds, sort, page), ajaxHeaders)
         }
         // Page 1: plain server-rendered results unless sort/category requested.
-        if (sort.isEmpty() && categoryId.isEmpty()) {
+        if (sort.isEmpty() && categoryIds.isEmpty()) {
             return GET("$baseUrl/search/${URLEncoder.encode(q, "UTF-8")}/", headers)
         }
-        return GET(buildSearchUrl(q, categoryId, sort, 1), ajaxHeaders)
+        return GET(buildSearchUrl(q, categoryIds, sort, 1), ajaxHeaders)
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage =
-        parseCatalog(response, isSearch = true)
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val first = parseCatalog(response, isSearch = true)
+        val plan = pendingMerge ?: return first
+
+        val merged = LinkedHashMap<String, SAnime>()
+        first.animes.forEach { merged[it.url] = it }
+        var hasNextPage = first.hasNextPage
+
+        plan.urls.forEach { url ->
+            runCatching {
+                client.newCall(GET(url, headers)).execute().use { extra ->
+                    val extraPage = parseCatalog(extra, isSearch = true)
+                    extraPage.animes.forEach { merged.putIfAbsent(it.url, it) }
+                    hasNextPage = hasNextPage || extraPage.hasNextPage
+                }
+            }
+        }
+        return AnimesPage(merged.values.toList(), hasNextPage)
+    }
 
     // ============================== Filters ===============================
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        AnimeFilter.Header("Filters apply to Browse/Search (text query optional)."),
         SortFilter(),
-        CategoryFilter(),
-        AnimeFilter.Header("Tag / Studio: slug or name (e.g. ahegao, queen-bee)."),
-        TagFilter(),
-        StudioFilter(),
+        AnimeFilter.Separator(),
+        AnimeFilter.Header("Every ticked box adds its own listing to the results"),
+        AnimeFilter.Header("A text query searches the catalogue (and ignores"),
+        AnimeFilter.Header("tags/models); ticked categories still narrow it"),
+        CategoryGroup(),
+        TagGroup(),
+        ModelGroup(),
     )
 
     private class SortFilter : AnimeFilter.Select<String>(
@@ -137,15 +168,35 @@ class OnlyHentaiStuff : AnimeHttpSource() {
         fun selected(): String = SORTS[state].second
     }
 
-    private class CategoryFilter : AnimeFilter.Select<String>(
-        "Category",
-        CATEGORIES.map { it.first }.toTypedArray(),
-    ) {
-        fun selectedId(): String = CATEGORIES[state].second
-    }
+    private class CategoryFilter(name: String, val slug: String) : AnimeFilter.CheckBox(name)
 
-    private class TagFilter : AnimeFilter.Text("Tag")
-    private class StudioFilter : AnimeFilter.Text("Studio / Director")
+    private class TagFilter(name: String, val slug: String) : AnimeFilter.CheckBox(name)
+
+    private class ModelFilter(name: String, val slug: String) : AnimeFilter.CheckBox(name)
+
+    private class CategoryGroup : AnimeFilter.Group<AnimeFilter<*>>(
+        "Categories",
+        CATEGORY_TERMS.map { CategoryFilter(it.second, it.first) },
+    )
+
+    private class TagGroup : AnimeFilter.Group<AnimeFilter<*>>(
+        "Tags",
+        TAG_TERMS.map { TagFilter(it.second, it.first) },
+    )
+
+    private class ModelGroup : AnimeFilter.Group<AnimeFilter<*>>(
+        "Studios / directors",
+        MODEL_TERMS.map { ModelFilter(it.second, it.first) },
+    )
+
+    private fun picked(filters: AnimeFilterList): List<AnimeFilter<*>> =
+        filters.flatMap { filter ->
+            if (filter is AnimeFilter.Group<*>) {
+                filter.state.filterIsInstance<AnimeFilter<*>>().filter { it.state == true }
+            } else {
+                listOf(filter)
+            }
+        }
 
     // ============================= Catalogue ==============================
 
@@ -387,49 +438,6 @@ class OnlyHentaiStuff : AnimeHttpSource() {
             "Longest" to "duration",
             "Most Commented" to "most_commented",
             "Most Favorited" to "most_favourited",
-        )
-
-        // (display, category_ids) — mapped live via h1 "New Videos in X",
-        // ids 1..35. Higher ids return empty on the search endpoint, so
-        // they are deliberately excluded.
-        private val CATEGORIES = listOf(
-            "All" to "",
-            "Oral Sex" to "1",
-            "Anal Sex" to "2",
-            "Rape" to "3",
-            "Big Tits" to "4",
-            "Hardcore" to "5",
-            "BDSM" to "6",
-            "Students" to "7",
-            "Erotic" to "8",
-            "Group Sex" to "9",
-            "Nurse" to "10",
-            "School" to "11",
-            "Maids" to "12",
-            "Incest" to "13",
-            "Fantasy" to "14",
-            "Tentacles" to "15",
-            "Yuri" to "16",
-            "Yaoi" to "17",
-            "Futanari" to "18",
-            "Classic sex" to "19",
-            "Masturbation" to "20",
-            "Lolicon" to "21",
-            "Twins" to "22",
-            "Shotacon" to "23",
-            "Fetishism / toys" to "24",
-            "Uncensored" to "25",
-            "Shounen-Ai" to "26",
-            "Virgin" to "27",
-            "Blowjob" to "28",
-            "Licking" to "29",
-            "Swimsuit" to "30",
-            "Magical girl" to "31",
-            "Kimono" to "32",
-            "Public / outdoor" to "33",
-            "Animal-girls" to "34",
-            "Small tits" to "35",
-            "Sci-Fi" to "41",
         )
 
         // category_ids -> /categories/{slug}/ for filter-only browsing.
