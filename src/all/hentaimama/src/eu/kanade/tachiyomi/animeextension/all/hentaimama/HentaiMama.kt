@@ -84,54 +84,165 @@ class HentaiMama : AnimeHttpSource() {
 
     // ============================== Search ================================
 
+    // The picker runs in the app, the merge runs in the parse step, so the selection
+    // has to survive between the two calls.
+    private var lastFilters: AnimeFilterList? = null
+    private var lastPage: Int = 1
+
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        var genre: String? = null
-        var studio: String? = null
-        filters.forEach { filter ->
-            when (filter) {
-                is GenreFilter -> genre = GENRES.getOrNull(filter.state)?.second?.ifBlank { null }
-                is StudioFilter -> studio = STUDIOS.getOrNull(filter.state)?.second?.ifBlank { null }
-                else -> {}
-            }
-        }
-        return when {
-            !genre.isNullOrBlank() -> GET("$baseUrl/genre/$genre/page/$page/", headers)
-            !studio.isNullOrBlank() -> GET("$baseUrl/studio/$studio/page/$page/", headers)
-            query.isNotBlank() -> GET(
+        lastFilters = filters
+        lastPage = page
+
+        // The site's search route and its taxonomy archives are separate worlds: a text
+        // query cannot be combined with a genre, so it is left to the search route.
+        if (query.isNotBlank()) {
+            return GET(
                 "$baseUrl/".toHttpUrl().newBuilder()
                     .addQueryParameter("s", query)
                     .addQueryParameter("page", page.toString())
                     .build(),
                 headers,
             )
+        }
+
+        // One pick per group rides in the primary request; the rest are merged below.
+        val genre = selected(filters, Facet.GENRE).firstOrNull()
+        val studio = selected(filters, Facet.STUDIO).firstOrNull()
+        return when {
+            genre != null -> GET("$baseUrl/genre/$genre/page/$page/", headers)
+            studio != null -> GET("$baseUrl/studio/$studio/page/$page/", headers)
             else -> GET("$baseUrl/tvshows/page/$page/", headers)
         }
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage =
-        archiveAnimesPage(response)
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val (rows, firstHasNext) = archiveRows(response)
+        val merged = LinkedHashMap<String, CatalogueRow>()
+        rows.forEach { merged[it.anime.url] = it }
+        var hasNextPage = firstHasNext
+
+        extraSelectionRequests().forEach { request ->
+            runCatching {
+                client.newCall(request).execute().use { extra ->
+                    val (extraRows, extraHasNext) = archiveRows(extra)
+                    extraRows.forEach { merged.putIfAbsent(it.anime.url, it) }
+                    hasNextPage = hasNextPage || extraHasNext
+                }
+            }
+        }
+
+        val filters = lastFilters
+        val wantedGenres = selected(filters, Facet.GENRE).toSet()
+        val wantedStudios = selected(filters, Facet.STUDIO).toSet()
+        val bannedGenres = excluded(filters, Facet.GENRE)
+        val bannedStudios = excluded(filters, Facet.STUDIO)
+
+        // Every card carries its own genre and studio links, so both sides are matched
+        // against the card rather than the URL. That is what makes the two groups
+        // combine (the site cannot express "/genre/x/ and /studio/y/" in one URL) and
+        // what makes an exclude tap real instead of decorative.
+        val animes = merged.values.filter { row ->
+            (wantedGenres.isEmpty() || row.genres.any { it in wantedGenres }) &&
+                (wantedStudios.isEmpty() || row.studios.any { it in wantedStudios }) &&
+                row.genres.none { it in bannedGenres } &&
+                row.studios.none { it in bannedStudios }
+        }.map { it.anime }
+
+        return AnimesPage(animes, hasNextPage)
+    }
+
+    /**
+     * One request per extra pick, because the site takes a single taxonomy at a time.
+     *
+     * Capped so a large selection cannot turn one page load into dozens of requests.
+     */
+    private fun extraSelectionRequests(): List<Request> {
+        val filters = lastFilters ?: return emptyList()
+        val requests = mutableListOf<Request>()
+        selected(filters, Facet.GENRE).drop(1).forEach { slug ->
+            if (requests.size < MAX_MERGE_REQUESTS) {
+                requests += GET("$baseUrl/genre/$slug/page/$lastPage/", headers)
+            }
+        }
+        selected(filters, Facet.STUDIO).drop(1).forEach { slug ->
+            if (requests.size < MAX_MERGE_REQUESTS) {
+                requests += GET("$baseUrl/studio/$slug/page/$lastPage/", headers)
+            }
+        }
+        return requests
+    }
 
     // ============================== Filters ===============================
 
+    private enum class Facet { GENRE, STUDIO }
+
+    /** One row per term: tap to include, tap again to exclude. */
+    private class TermFilter(name: String, val slug: String, val facet: Facet) :
+        AnimeFilter.TriState(name, AnimeFilter.TriState.STATE_IGNORE)
+
+    private class TermGroup(name: String, terms: List<Pair<String, String>>, facet: Facet) :
+        AnimeFilter.Group<AnimeFilter<*>>(name, terms.map { TermFilter(it.second, it.first, facet) })
+
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        AnimeFilter.Header("Ignored when searching with a query"),
-        GenreFilter(),
-        StudioFilter(),
+        AnimeFilter.Header("Tap to include, tap again to exclude"),
+        AnimeFilter.Header("Picks inside a group are combined; groups AND together"),
+        AnimeFilter.Header("A text query is searched on its own (the site ignores these then)"),
+        TermGroup("Genres", GENRES, Facet.GENRE),
+        TermGroup("Studios", STUDIOS, Facet.STUDIO),
     )
 
-    private class GenreFilter : AnimeFilter.Select<String>("Genre", GENRES.map { it.first }.toTypedArray())
+    private fun flatFilters(filters: AnimeFilterList?): List<AnimeFilter<*>> =
+        filters.orEmpty().flatMap { filter ->
+            if (filter is AnimeFilter.Group<*>) {
+                filter.state.filterIsInstance<AnimeFilter<*>>()
+            } else {
+                listOf(filter)
+            }
+        }
 
-    private class StudioFilter : AnimeFilter.Select<String>("Studio", STUDIOS.map { it.first }.toTypedArray())
+    private fun termsInState(filters: AnimeFilterList?, facet: Facet, state: Int): List<String> =
+        flatFilters(filters)
+            .filterIsInstance<TermFilter>()
+            .filter { it.facet == facet && it.state == state }
+            .map { it.slug }
+
+    private fun selected(filters: AnimeFilterList?, facet: Facet): List<String> =
+        termsInState(filters, facet, AnimeFilter.TriState.STATE_INCLUDE)
+
+    private fun excluded(filters: AnimeFilterList?, facet: Facet): Set<String> =
+        termsInState(filters, facet, AnimeFilter.TriState.STATE_EXCLUDE).toSet()
 
     // ============================== Catalogue parsing =====================
 
-    private fun archiveAnimesPage(response: Response): AnimesPage {
+    /** A catalogue card plus the taxonomy slugs it links to. */
+    private class CatalogueRow(val anime: SAnime, val genres: Set<String>, val studios: Set<String>)
+
+    private fun archiveRows(response: Response): Pair<List<CatalogueRow>, Boolean> {
         val doc = response.asJsoup()
-        val animes = doc.select("article").mapNotNull(::seriesCard)
+        val rows = doc.select("article").mapNotNull { el ->
+            val anime = seriesCard(el) ?: return@mapNotNull null
+            CatalogueRow(anime, taxonomySlugs(el, "/genre/"), taxonomySlugs(el, "/studio/"))
+        }
         val pages = doc.selectFirst("div.pagination")?.attr("data-pages")?.toIntOrNull()
-        val hasNext = if (pages != null) response.page() < pages else animes.isNotEmpty()
-        return AnimesPage(animes, hasNext)
+        val hasNext = if (pages != null) response.page() < pages else rows.isNotEmpty()
+        return rows to hasNext
     }
+
+    private fun archiveAnimesPage(response: Response): AnimesPage {
+        val (rows, hasNext) = archiveRows(response)
+        return AnimesPage(rows.map { it.anime }, hasNext)
+    }
+
+    /** Slugs of the `/genre/...` or `/studio/...` links inside one card. */
+    private fun taxonomySlugs(el: Element, marker: String): Set<String> =
+        el.select("a[href*=$marker]")
+            .mapNotNull { anchor ->
+                anchor.attr("href")
+                    .substringAfter(marker, "")
+                    .substringBefore('/')
+                    .takeIf { it.isNotBlank() }
+            }
+            .toSet()
 
     /** Handles both archive cards (article.item.tvshows) and search rows (article.series-card). */
     private fun seriesCard(el: Element): SAnime? {
@@ -358,63 +469,12 @@ class HentaiMama : AnimeHttpSource() {
 
         private const val NO_SYNOPSIS = "No synopsis added for this episode yet"
 
+        /** Upper bound on merge requests for one page load. */
+        private const val MAX_MERGE_REQUESTS = 8
+
         private val DATE_FORMAT = SimpleDateFormat("MMM d, yyyy", Locale.US)
 
         // jwplayer setup: sources: [{type: "mp4", file: "https://..."}, ...]
         private val SOURCE_REGEX = Regex("""sources:\s*\[\s*\{\s*type:\s*"([^"]+)",\s*file:\s*"([^"]+)"""")
-
-        private val GENRES = listOf(
-            "Any" to "",
-            "3D" to "3d",
-            "Ahegao" to "ahegao",
-            "Anal" to "anal",
-            "BDSM" to "bdsm",
-            "Blackmail" to "blackmail",
-            "Blowjob" to "blowjob",
-            "Brainwashed" to "brainwashed",
-            "Creampie" to "creampie",
-            "Cute/Funny" to "cutefunny",
-            "Deepthroat" to "deepthroat",
-            "Domination" to "domination",
-            "Futanari" to "futanari",
-            "Harem" to "harem",
-            "Horny Slut" to "horny-slut",
-            "Housewife" to "housewife",
-            "Humiliation" to "humiliation",
-            "Internal Cumshot" to "internal-cumshot",
-            "Large Breasts" to "large-breasts",
-            "Megane" to "megane",
-            "MILF" to "milf",
-            "Mind Break" to "mind-break",
-            "Molestation" to "molestation",
-            "Office Ladies" to "office-ladies",
-            "Public Sex" to "public-sex",
-            "Rape" to "rape",
-            "School Girls" to "school-girls",
-            "Small Breasts" to "small-breasts",
-            "Stocking" to "stocking",
-            "Strap-on" to "strap-on",
-            "Swimsuit" to "swimsuit",
-            "Threesome" to "three-some",
-            "Tits Fuck" to "tits-fuck",
-            "Toys" to "toys",
-            "Tsundere" to "tsundere",
-            "Ugly Bastard" to "ugly-bastard",
-            "Uncensored" to "uncensored",
-            "Urination" to "urination",
-            "Virgins" to "virgins",
-            "X-Ray" to "x-ray",
-            "Yuri" to "yuri",
-        )
-
-        private val STUDIOS = listOf(
-            "Any" to "",
-            "Bunnywalker" to "bunnywalker",
-            "Collaboration Works" to "collaboration-works",
-            "Majin" to "majin",
-            "Mary Jane" to "mary-jane",
-            "NuR" to "nur",
-            "Pink Pineapple" to "pink-pineapple",
-        )
     }
 }
