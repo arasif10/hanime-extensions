@@ -74,24 +74,26 @@ class Hentaicity : AnimeHttpSource() {
 
     // ============================== Search ================================
 
+    // The picker runs in the app and the merge runs in the parse step, so the
+    // selection has to survive between the two calls.
+    private var pendingMerge: MergePlan? = null
+
+    private class MergePlan(
+        val page: Int,
+        val categories: List<String>,
+        val tags: List<String>,
+        val params: List<Pair<String, String>>,
+        val sort: String,
+    )
+
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
         val filterList = if (filters.isEmpty()) getFilterList() else filters
 
-        var sort = SORT_RECENT
-        var category = CATEGORY_DEFAULT
-        var tag = ""
-        var duration = ""
-        var hdOnly = false
-        filterList.forEach { f ->
-            when (f) {
-                is SortFilter -> sort = f.sortValue
-                is CategoryFilter -> category = f.category
-                is TagFilter -> tag = f.state.trim()
-                is DurationFilter -> duration = f.durationValue
-                is HdFilter -> hdOnly = f.state
-                else -> {}
-            }
-        }
+        val sort = filterList.filterIsInstance<SortFilter>().firstOrNull()?.sortValue ?: SORT_RECENT
+        val categories = pickedCategories(filterList)
+        val tags = pickedTags(filterList)
+        val duration = filterList.filterIsInstance<DurationFilter>().firstOrNull()?.durationValue.orEmpty()
+        val hdOnly = filterList.filterIsInstance<HdFilter>().firstOrNull()?.state == true
 
         // min_width/min_duration are supported on the catalog and tag browse
         // pages (verified against the site's filter form); the text-search
@@ -99,6 +101,13 @@ class Hentaicity : AnimeHttpSource() {
         val params = buildList {
             if (hdOnly) add("min_width" to "1280")
             if (duration.isNotBlank()) add("min_duration" to duration)
+        }
+
+        // Every pick contributes its own listing; the rest are merged in the parse.
+        pendingMerge = if (categories.size + tags.size > 1) {
+            MergePlan(page, categories, tags, params, sort)
+        } else {
+            null
         }
 
         val text = query.trim()
@@ -109,20 +118,68 @@ class Hentaicity : AnimeHttpSource() {
             return GET(path, headers)
         }
 
-        if (tag.isNotEmpty()) {
-            // Tag browse: /tags/video/{tag} (page 1, NO trailing slash) and
-            // /tags/video/{tag}/{page}/ for deeper pages. Sort/category do not
-            // apply on tag pages.
-            val encoded = URLEncoder.encode(tag, "UTF-8").replace("+", "%20")
-            val base = if (page > 1) "$baseUrl/tags/video/$encoded/$page/" else "$baseUrl/tags/video/$encoded"
-            return GET(addParams(base, params), headers)
-        }
+        // Tag browsing is its own route: it ignores sort and category, so when a tag
+        // is picked it decides the primary request and every category is merged in.
+        tags.firstOrNull()?.let { slug -> return GET(tagUrl(slug, page, params), headers) }
 
-        return catalogRequest(sort, category, page, params)
+        return catalogRequest(sort, categories.firstOrNull() ?: CATEGORY_DEFAULT, page, params)
     }
 
-    override fun searchAnimeParse(response: Response): AnimesPage =
-        parseCatalog(response)
+    override fun searchAnimeParse(response: Response): AnimesPage {
+        val first = parseCatalog(response)
+        val plan = pendingMerge ?: return first
+
+        val merged = LinkedHashMap<String, SAnime>()
+        first.animes.forEach { merged[it.url] = it }
+        var hasNextPage = first.hasNextPage
+
+        mergeRequests(plan).forEach { request ->
+            runCatching {
+                client.newCall(request).execute().use { extra ->
+                    val extraPage = parseCatalog(extra)
+                    extraPage.animes.forEach { merged.putIfAbsent(it.url, it) }
+                    hasNextPage = hasNextPage || extraPage.hasNextPage
+                }
+            }
+        }
+        return AnimesPage(merged.values.toList(), hasNextPage)
+    }
+
+    /**
+     * The listings the primary request did not cover.
+     *
+     * When the primary request is a tag page it covers no category at all, so every
+     * picked category is fetched; otherwise the first category was in the primary
+     * request and only the rest are needed.
+     */
+    private fun mergeRequests(plan: MergePlan): List<Request> {
+        val requests = mutableListOf<Request>()
+        plan.tags.drop(1).forEach { slug ->
+            if (requests.size < MAX_MERGE_REQUESTS) {
+                requests += GET(tagUrl(slug, plan.page, plan.params), headers)
+            }
+        }
+        val remainingCategories = if (plan.tags.isEmpty()) plan.categories.drop(1) else plan.categories
+        remainingCategories.forEach { slug ->
+            if (requests.size < MAX_MERGE_REQUESTS) {
+                requests += catalogRequest(plan.sort, slug, plan.page, plan.params)
+            }
+        }
+        return requests
+    }
+
+    /**
+     * Tag browse: /tags/video/{tag} (page 1, NO trailing slash) and
+     * /tags/video/{tag}/{page}/ for deeper pages.
+     *
+     * Slugs carry `+` where the site means a space ("3d+anal"); leaving the `+` out
+     * of the encoder keeps it a separator instead of turning it into `%2B`.
+     */
+    private fun tagUrl(tag: String, page: Int, params: List<Pair<String, String>>): String {
+        val encoded = URLEncoder.encode(tag.replace('+', ' ').trim(), "UTF-8").replace("+", "%20")
+        val base = if (page > 1) "$baseUrl/tags/video/$encoded/$page/" else "$baseUrl/tags/video/$encoded"
+        return addParams(base, params)
+    }
 
     /**
      * Parses the response body exactly once — okhttp bodies are one-shot and a
@@ -345,12 +402,21 @@ class Hentaicity : AnimeHttpSource() {
         val sortValue: String get() = SORTS[state].second
     }
 
-    private class CategoryFilter :
-        AnimeFilter.Select<String>("Category", CATEGORIES.map { it.second }.toTypedArray(), 0) {
-        val category: String get() = CATEGORIES[state].first
-    }
+    /** Category rows: ticking several merges their listings into one result set. */
+    private class CategoryFilter(name: String, val slug: String) : AnimeFilter.CheckBox(name)
 
-    private class TagFilter : AnimeFilter.Text("Tag (e.g. teacher)")
+    private class CategoryGroup : AnimeFilter.Group<AnimeFilter<*>>(
+        "Categories",
+        CATEGORIES.map { CategoryFilter(it.second, it.first) },
+    )
+
+    /** Tag rows: same idea, each ticked tag adds its own listing. */
+    private class TagFilter(name: String, val slug: String) : AnimeFilter.CheckBox(name)
+
+    private class TagGroup : AnimeFilter.Group<AnimeFilter<*>>(
+        "Tags",
+        TAGS.map { TagFilter(it.second, it.first) },
+    )
 
     /** (min_duration value, label) — values from the site's filter form. */
     private class DurationFilter :
@@ -362,14 +428,29 @@ class Hentaicity : AnimeHttpSource() {
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
         SortFilter(),
-        CategoryFilter(),
         DurationFilter(),
         HdFilter(),
         AnimeFilter.Separator(),
-        TagFilter(),
-        AnimeFilter.Header("Text search overrides all filters; tag browsing"),
-        AnimeFilter.Header("ignores sort/category (site limitation)"),
+        AnimeFilter.Header("Every ticked category or tag adds its own listing"),
+        AnimeFilter.Header("to the results; a text search ignores all of them"),
+        CategoryGroup(),
+        TagGroup(),
     )
+
+    private fun flatFilters(filters: AnimeFilterList): List<AnimeFilter<*>> =
+        filters.flatMap { filter ->
+            if (filter is AnimeFilter.Group<*>) {
+                filter.state.filterIsInstance<AnimeFilter<*>>()
+            } else {
+                listOf(filter)
+            }
+        }
+
+    private fun pickedCategories(filters: AnimeFilterList): List<String> =
+        flatFilters(filters).filterIsInstance<CategoryFilter>().filter { it.state }.map { it.slug }
+
+    private fun pickedTags(filters: AnimeFilterList): List<String> =
+        flatFilters(filters).filterIsInstance<TagFilter>().filter { it.state }.map { it.slug }
 
     companion object {
         private const val UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -377,6 +458,9 @@ class Hentaicity : AnimeHttpSource() {
         private const val SORT_RECENT = "recent"
         private const val SORT_POPULAR = "popular"
         private const val CATEGORY_DEFAULT = "hentai"
+
+        /** Upper bound on merge requests for one page load. */
+        private const val MAX_MERGE_REQUESTS = 10
 
         /** (url slug, label) — order follows the site's sort nav. */
         private val SORTS = listOf(
@@ -389,7 +473,7 @@ class Hentaicity : AnimeHttpSource() {
 
         /** (url slug, label) — the site's category taxonomy. */
         private val CATEGORIES = listOf(
-            "hentai" to "Hentai (default)",
+            "hentai" to "Hentai",
             "all" to "All",
             "3d" to "3D",
             "anal" to "Anal",
