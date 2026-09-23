@@ -66,7 +66,7 @@ class HStream : AnimeHttpSource() {
     // ============================== Catalogue ==============================
 
     override fun popularAnimeRequest(page: Int): Request =
-        searchRequest(page, order = "most-views")
+        searchRequest(page, order = "view-count")
 
     override fun popularAnimeParse(response: Response): AnimesPage =
         searchAnimeParse(response)
@@ -78,8 +78,8 @@ class HStream : AnimeHttpSource() {
         searchAnimeParse(response)
 
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val (order, tags) = parseFilters(filters)
-        return searchRequest(page, order = order, query = query, tags = tags)
+        val (order, tags, studios) = parseFilters(filters)
+        return searchRequest(page, order = order, query = query, tags = tags, studios = studios)
     }
 
     private fun searchRequest(
@@ -87,11 +87,13 @@ class HStream : AnimeHttpSource() {
         order: String? = null,
         query: String? = null,
         tags: List<String> = emptyList(),
+        studios: List<String> = emptyList(),
     ): Request {
         val url = "$baseUrl/search".toHttpUrl().newBuilder().apply {
             addQueryParameter("live-search", query.orEmpty())
             addQueryParameter("order", order.orEmpty())
             tags.forEachIndexed { i, tag -> addQueryParameter("tags[$i]", tag) }
+            studios.forEachIndexed { i, studio -> addQueryParameter("studios[$i]", studio) }
             if (page > 1) addQueryParameter("page", page.toString())
         }.build()
         return GET(url.toString(), headers)
@@ -144,49 +146,50 @@ class HStream : AnimeHttpSource() {
     // ============================== Filters ==============================
 
     override fun getFilterList(): AnimeFilterList = AnimeFilterList(
-        AnimeFilter.Header("Ignored when searching with a query"),
         OrderFilter(),
+        AnimeFilter.Separator(),
+        AnimeFilter.Header("The site ANDs everything: a title must carry"),
+        AnimeFilter.Header("every ticked genre and studio"),
+        AnimeFilter.Header("Ignored when searching with a query"),
         TagFilter(),
+        StudioFilter(),
     )
 
     private class OrderFilter : AnimeFilter.Select<String>(
         "Order",
-        arrayOf(
-            "Recently Uploaded",
-            "Recently Released",
-            "Trending",
-            "Most Views",
-            "Most Likes",
-            "Popular Weekly",
-            "Popular Monthly",
-        ),
+        ORDERS.map { it.second }.toTypedArray(),
         0,
     ) {
         val value: String
-            get() = ORDERS[state]
+            get() = ORDERS[state].first
     }
 
-    private class TagFilter : AnimeFilter.Group<TagFilter.Box>(
-        "Tags",
-        TAGS.map { Box(it.second, it.first) },
-    ) {
+    /** Livewire checkbox group; the site calls its tag list "Genres". */
+    private open class TermGroup(name: String, terms: List<Pair<String, String>>) :
+        AnimeFilter.Group<TermGroup.Box>(name, terms.map { Box(it.second, it.first) }) {
         class Box(name: String, val slug: String) : AnimeFilter.CheckBox(name)
 
         val selected: List<String>
             get() = state.filter { it.state }.map { it.slug }
     }
 
-    private fun parseFilters(filters: AnimeFilterList): Pair<String, List<String>> {
-        var order = "recently-uploaded"
+    private class TagFilter : TermGroup("Genres", TAGS)
+
+    private class StudioFilter : TermGroup("Studios", STUDIOS)
+
+    private fun parseFilters(filters: AnimeFilterList): Triple<String, List<String>, List<String>> {
+        var order = ORDERS[0].first
         var tags: List<String> = emptyList()
+        var studios: List<String> = emptyList()
         filters.forEach { filter ->
             when (filter) {
                 is OrderFilter -> order = filter.value
                 is TagFilter -> tags = filter.selected
+                is StudioFilter -> studios = filter.selected
                 else -> {}
             }
         }
-        return order to tags
+        return Triple(order, tags, studios)
     }
 
     // ============================== Anime Details ==============================
@@ -387,84 +390,19 @@ class HStream : AnimeHttpSource() {
         /** /images/hentai/{series-slug}/(gallery|cover)-ep-{N}... on any card image. */
         private val IMAGE_PATH = Regex("""/images/hentai/([a-z0-9-]+)/(?:gallery|cover)-ep-(\d+)""")
 
-        private val ORDERS = arrayOf(
-            "recently-uploaded",
-            "recently-released",
-            "trending",
-            "most-views",
-            "most-likes",
-            "popular-weekly",
-            "popular-monthly",
-        )
-
-        // (slug, display) pairs from the site's tag sidebar.
-        private val TAGS = arrayOf(
-            "3d" to "3D",
-            "48fps" to "48fps",
-            "4k" to "4K",
-            "4k-48fps" to "4K 48fps",
-            "ahegao" to "Ahegao",
-            "anal" to "Anal",
-            "bdsm" to "BDSM",
-            "bestiality" to "Bestiality",
-            "big-boobs" to "Big Boobs",
-            "blow-job" to "Blow Job",
-            "bondage" to "Bondage",
-            "boob-job" to "Boob Job",
-            "censored" to "Censored",
-            "comedy" to "Comedy",
-            "cosplay" to "Cosplay",
-            "creampie" to "Creampie",
-            "dark-skin" to "Dark Skin",
-            "elf" to "Elf",
-            "facial" to "Facial",
-            "fantasy" to "Fantasy",
-            "filmed" to "Filmed",
-            "foot-job" to "Foot Job",
-            "futanari" to "Futanari",
-            "gangbang" to "Gangbang",
-            "glasses" to "Glasses",
-            "gore" to "Gore",
-            "hand-job" to "Hand Job",
-            "harem" to "Harem",
-            "horror" to "Horror",
-            "incest" to "Incest",
-            "inflation" to "Inflation",
-            "lactation" to "Lactation",
-            "lq" to "LQ",
-            "maid" to "Maid",
-            "masturbation" to "Masturbation",
-            "milf" to "MILF",
-            "mind-break" to "Mind Break",
-            "mind-control" to "Mind Control",
-            "monster" to "Monster",
-            "nekomimi" to "Nekomimi",
-            "netorare" to "Netorare",
-            "nurse" to "Nurse",
-            "ogre" to "Ogre",
-            "orc" to "Orc",
-            "plot" to "Plot",
-            "pregnant" to "Pregnant",
-            "reverse-gangbang" to "Reverse Gangbang",
-            "rimjob" to "Rimjob",
-            "school-girl" to "School Girl",
-            "scat" to "Scat",
-            "shota" to "Shota",
-            "softcore" to "Softcore",
-            "stockings" to "Stockings",
-            "swimsuit" to "Swimsuit",
-            "tentacle" to "Tentacle",
-            "threesome" to "Threesome",
-            "toys" to "Toys",
-            "trap" to "Trap",
-            "tsundere" to "Tsundere",
-            "uncensored" to "Uncensored",
-            "vanilla" to "Vanilla",
-            "virgin" to "Virgin",
-            "voyeurism" to "Voyeurism",
-            "x-ray" to "X-Ray",
-            "yaoi" to "Yaoi",
-            "yuri" to "Yuri",
+        // (slug, label) — exactly the options the site's own sort dropdown posts,
+        // each one verified to change the ordering. The previous list carried five
+        // values the site ignores ("trending", "most-views", "most-likes", ...), so
+        // picking them quietly returned the default order, and it was missing
+        // A-Z / Z-A / oldest-* / view-count entirely.
+        private val ORDERS = listOf(
+            "recently-uploaded" to "Recently Uploaded",
+            "recently-released" to "Recently Released",
+            "view-count" to "Most Viewed",
+            "oldest-uploads" to "Oldest Uploads",
+            "oldest-releases" to "Oldest Releases",
+            "az" to "A-Z",
+            "za" to "Z-A",
         )
     }
 }
